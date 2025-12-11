@@ -146,31 +146,28 @@ def save_image(image_bytes: bytes, user_id: str, metadata: dict) -> dict:
 
 def map_log_to_friendly_status(line: str) -> Optional[str]:
     """
-    Translates raw Airflow logs into friendly user status messages.
-    Returns None if the line is system noise.
+    Now returns the raw log message (without timestamp, file, level prefix).
+    Returns None only for empty or irrelevant lines.
     """
-    # 1. Map Task Starts to Phases
-    if "task_id=fetch_and_inspect_image" in line or "Executing <Task(PythonOperator): fetch_and_inspect_image>" in line:
-        return "📂 Fetching image from storage..."
+    line = line.strip()
+    if not line:
+        return None
     
-    if "task_id=generate_final_report" in line or "Executing <Task(PythonOperator): generate_final_report>" in line:
-        return "📝 Verifying data and preparing response..."
+    # Skip Airflow internal framework lines
+    if any(marker in line for marker in ["Pre task execution logs", "Post task execution logs", "Log message source details"]):
+        return None
 
-    # 2. Map Your Custom DAG Logs (The logging.info calls you wrote)
-    if "STEP 1: Fetching" in line:
-        return "🔍 Inspecting file metadata..."
-    
-    if "Image found" in line:
-        return "✅ Image verification successful."
-    
-    if "File not found" in line:
-        return "❌ Error: Image not found."
+    # Remove timestamp + file + level prefix like:
+    # [2025-12-11, 19:49:20 UTC] {clipfoundry-image-retrieval.py:19} INFO - 
+    if "INFO -" in line:
+        return line.split("INFO -", 1)[-1].strip()
+    if "ERROR" in line:
+        return line.split("ERROR", 1)[-1].strip()
+    if "WARNING" in line:
+        return line.split("WARNING", 1)[-1].strip()
 
-    # 3. Map Completion
-    if "Marking task as SUCCESS" in line:
-        return None # Skip this, we'll let the next task start message handle the transition
-
-    return None
+    # Fallback: return the whole line if no level found (e.g. "Done. Returned value was: ...")
+    return line
 
 def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str) -> list:
     """Fetches and cleans logs for the specific task run."""
@@ -197,7 +194,8 @@ def get_current_try_number(run_id: str, dag_id: str, task_id: str) -> int:
 async def generate_stream_response(model: str, image_path: str, original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str) -> AsyncGenerator[str, None]:
     """Streaming response with Airflow logs inside a <think> block."""
     
-    task_id = AIRFLOW_TASK_ID
+    task_id = None  # Will be dynamic
+    request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4()))
     # --- Start the visible <think> block ---
     think_open = "<think>\n"
     yield StreamChunk(
@@ -217,7 +215,7 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
             "X-LTAI-User-Name": user_name,
             "X-LTAI-Vault-User": vault_user,
             "X-LTAI-Vault-Keys": vault_keys,
-            "X-LTAI-Request-ID": str(uuid.uuid4())
+            "X-LTAI-Request-ID": request_id
         }
         # Construct chat_inputs (adapt to existing structure)
         last_message = messages[-1] if messages else {}
@@ -249,60 +247,89 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
         resp.raise_for_status()
         dag_run_id = resp.json()['dag_run_id']
 
-        # 2. Poll Status & Stream Business Logic Logs
+        # Get all task instances
+        ti_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances"
+        ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
+        task_instances = ti_resp.json().get("task_instances", []) if ti_resp.status_code == 200 else []
+
+        seen_tasks = set()
+        last_success_task = None
+
         status = "running"
-        last_log_idx = 0
-        seen_messages = set() # To prevent repeating the same status
-        
         while status in ["queued", "running"]:
             await asyncio.sleep(2) # Polling interval
-            
-            # Check Status
-            status_resp = requests.get(f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}", headers=AIRFLOW_HEADERS)
-            if status_resp.status_code == 200:
-                status = status_resp.json()['state']
-            
-            # Fetch and Stream Logs
-            try_num = get_current_try_number(dag_run_id, dag_id, task_id)
-            raw_lines = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
-            
-            if len(raw_lines) > last_log_idx:
-                new_lines = raw_lines[last_log_idx:]
-                for line in new_lines:
-                    # Clean the log using the helper from previous step
-                    clean_msg  = map_log_to_friendly_status(line)
-                    if clean_msg and clean_msg not in seen_messages:
-                        # Stream the specific log line into the think block
-                        seen_messages.add(clean_msg)
+
+            # Refresh run state
+            run_resp = requests.get(f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}", headers=AIRFLOW_HEADERS)
+            if run_resp.status_code == 200:
+                status = run_resp.json().get("state", "running")
+
+            # Poll each task
+            for ti in task_instances:
+                task_id = ti["task_id"]
+                state = ti.get("state", "scheduled")
+
+                if task_id in seen_tasks:
+                    continue
+
+                if state in ["running", "queued"]:
+                    yield StreamChunk(
+                        model=model,
+                        created_at=datetime.now().isoformat(),
+                        message=ChatMessage(role="assistant", content=f"Task `{task_id}` started\n"),
+                        done=False
+                    ).model_dump_json() + "\n"
+                    seen_tasks.add(task_id)
+
+                # Refresh task instance state
+                latest = requests.get(f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}", headers=AIRFLOW_HEADERS)
+                if latest.status_code == 200:
+                    current_state = latest.json().get("state")
+                    try_num = latest.json().get("try_number", 1)
+
+                    if current_state == "success" and task_id not in seen_tasks:
                         yield StreamChunk(
                             model=model,
                             created_at=datetime.now().isoformat(),
-                            message=ChatMessage(role="assistant", content=f"{clean_msg}\n"),
+                            message=ChatMessage(role="assistant", content=f"Task `{task_id}` completed\n"),
                             done=False
                         ).model_dump_json() + "\n"
-                last_log_idx = len(raw_lines)
+                        last_success_task = task_id
+                        seen_tasks.add(task_id)
 
-        # 3. Fetch XCom Result (Hidden Logic)
-        xcom_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}/xcomEntries/return_value"
-        xcom_resp = requests.get(xcom_url, headers=AIRFLOW_HEADERS)
-        
-        final_content = ""
-        if xcom_resp.status_code == 200:
-            raw_val = xcom_resp.json()['value']
-            data = ast.literal_eval(raw_val) if isinstance(raw_val, str) else raw_val
-            
-            if data.get("status") == "success":
-                final_content = (
-                    f"✅ **Processing Complete**\n\n"
-                    f"The image `{os.path.basename(data.get('image_path', ''))}` was verified successfully.\n"
-                    f"**Details:**\n"
-                    f"* File Size: {data.get('file_size')} bytes\n"
-                    f"* Verification: {data.get('message')}"
-                )
+                    # Stream logs while task is running
+                    if current_state in ["running", "queued"]:
+                        logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
+                        for line in logs[-20:]:  # last 20 lines
+                            clean = map_log_to_friendly_status(line)
+                            if clean:
+                                yield StreamChunk(
+                                    model=model,
+                                    created_at=datetime.now().isoformat(),
+                                    message=ChatMessage(role="assistant", content=f"{clean}\n"),
+                                    done=False
+                                ).model_dump_json() + "\n"
+
+        # Final XCom from last successful task
+        final_content = "DAG completed but no result found."
+        if last_success_task:
+            xcom_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{last_success_task}/xcomEntries/return_value"
+            xcom_resp = requests.get(xcom_url, headers=AIRFLOW_HEADERS)
+            if xcom_resp.status_code == 200:
+                raw = xcom_resp.json().get("value")
+                data = ast.literal_eval(raw) if isinstance(raw, str) else raw
+                if data.get("status") == "success":
+                    final_content = (
+                        f"**Processing Complete**\n\n"
+                        f"The image `{os.path.basename(data.get('image_path', ''))}` was verified successfully.\n"
+                        f"**Details:**\n"
+                        f"* File Size: {data.get('file_size')} bytes\n"
+                        f"* Verification: {data.get('message')}"
+                    )
+                else:
+                    final_content = f"**Processing Failed**: {data.get('message')}"
             else:
-                final_content = f"❌ **Processing Failed**: {data.get('message')}"
-        else:
-            final_content = f"⚠️ DAG finished ({status}), but failed to retrieve XCom results."
+                final_content = "DAG finished, but result retrieval failed."
 
     except Exception as e:
         logger.error(f"Workflow failed: {str(e)}")
@@ -411,6 +438,7 @@ async def chat_dag(request: Request):
         user_email = headers.get('x-openwebui-user-email', 'anonymous@test.com')
         user_id = headers.get('x-openwebui-user-id', 'anonymous')
         user_name = headers.get('x-openwebui-user-name', 'Anonymous User')
+        request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4())[:8])
         
         logger.info(f"Chat request from user: {user_email} (ID: {user_id})")
         
@@ -451,7 +479,7 @@ async def chat_dag(request: Request):
             for idx, base64_image in enumerate(images, 1):
                 try:
                     image_bytes, metadata = verify_and_decode_image(base64_image)
-                    save_info = save_image(image_bytes, user_id, metadata)
+                    save_info = save_image(image_bytes, request_id, metadata)
                     saved_images.append(save_info)
                     # Capture the absolute path for the DAG
                     last_saved_path = save_info['path']
@@ -473,7 +501,7 @@ async def chat_dag(request: Request):
                 f"\n✅ **Summary:**\n"
                 f"   • Images saved: {len(saved_images)}/{len(images)}\n"
                 f"   • Total size: {total_size / 1024:.2f} KB\n"
-                f"   • Storage: `{SHARED_STORAGE_PATH}/{user_id}/`\n"
+                f"   • Storage: `{SHARED_STORAGE_PATH}/{request_id}/`\n"
             )
         else:
             response_parts.append(
