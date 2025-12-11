@@ -44,7 +44,11 @@ RUN npm ci --force && \
     rm -rf node_modules .git
 
 ADD scripts /appz/scripts
-
+RUN mkdir /app/agent
+RUN python -m venv /app/agent/venv && \
+    /app/agent/venv/bin/pip install --upgrade pip && \
+    /app/agent/venv/bin/pip install -r /appz/scripts/requirements.txt; 
+    
 # Final stage
 FROM appz/python:3.11
 
