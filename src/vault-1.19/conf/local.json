@@ -1,0 +1,22 @@
+{
+	"disable_cache": "true",
+	"disable_mlock": "true",
+	"listener": [
+		{
+			"tcp": {
+				"address": "0.0.0.0:8200",
+				"tls_cert_file": "/vault/keys/vault-selfsigned.crt",
+				"tls_key_file": "/vault/keys/vault-selfsigned.key",
+				"tls_skip_verify": "true"
+			}
+		}
+	],
+	"api_addr": "https://127.0.0.1:8200",
+	"storage": {
+		"file": {
+			"path": "/appz/data"
+		}
+	},
+	"max_lease_ttl": "168h",
+	"default_lease_ttl": "168h"
+}

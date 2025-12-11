@@ -1,0 +1,14 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mariadb-data
+  namespace: nhpri-dev
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: local-storage
+  volumeName: mariadb-data-dev
+  resources:
+    requests:
+      storage: 5Gi

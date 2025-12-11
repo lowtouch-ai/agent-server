@@ -1,0 +1,12 @@
+---
+theme:
+  - name: astra
+    url: https://downloads.wordpress.org/theme/astra.4.11.17.zip
+plugins:
+   - https://downloads.wordpress.org/plugin/contact-form-7.6.1.4.zip
+   - https://downloads.wordpress.org/plugin/google-site-kit.1.167.0.zip
+   - https://downloads.wordpress.org/plugin/ultimate-addons-for-gutenberg.2.19.17.zip
+   - https://downloads.wordpress.org/plugin/contact-form-7-honeypot.3.3.0.zip
+   - https://downloads.wordpress.org/plugin/ultimate-addons-for-contact-form-7.3.5.33.zip
+   - https://downloads.wordpress.org/plugin/wordfence.8.1.3.zip
+

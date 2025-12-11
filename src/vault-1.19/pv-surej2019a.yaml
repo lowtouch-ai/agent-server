@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: vault-home 
+spec:
+  storageClassName: vault-home
+  capacity:
+    storage: 1Gi 
+  accessModes:
+    - ReadWriteOnce 
+  persistentVolumeReclaimPolicy: Retain 
+  nfs: 
+    path: /vault/home 
+    server: 192.168.0.171 
+    readOnly: false
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: vault-data 
+spec:
+  storageClassName: vault-data
+  capacity:
+    storage: 1Gi 
+  accessModes:
+    - ReadWriteOnce 
+  persistentVolumeReclaimPolicy: Retain 
+  nfs: 
+    path: /vault/data 
+    server: 192.168.0.171 
+    readOnly: false
