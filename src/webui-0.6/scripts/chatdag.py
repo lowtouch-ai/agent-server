@@ -4,7 +4,7 @@ import logging
 import base64
 import json
 from pathlib import Path
-from typing import Optional, List, AsyncGenerator
+from typing import Optional, List, AsyncGenerator, Dict, Any
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -17,6 +17,7 @@ import asyncio
 import requests
 import re
 import ast
+import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 # --- AIRFLOW CONFIGURATION ---
 AIRFLOW_HOST = os.getenv("AIRFLOW_HOST")
-AIRFLOW_DAG_ID = "image_processor_v1"
 AIRFLOW_TASK_ID = "generate_final_report"
 AIRFLOW_API_KEY = os.getenv("AIRFLOW_API_KEY") 
 AIRFLOW_HEADERS = {
@@ -172,9 +172,9 @@ def map_log_to_friendly_status(line: str) -> Optional[str]:
 
     return None
 
-def get_airflow_logs(run_id: str, try_number: int) -> list:
+def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str) -> list:
     """Fetches and cleans logs for the specific task run."""
-    url = f"{AIRFLOW_HOST}/dags/{AIRFLOW_DAG_ID}/dagRuns/{run_id}/taskInstances/{AIRFLOW_TASK_ID}/logs/{try_number}"
+    url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}"
     try:
         res = requests.get(url, headers=AIRFLOW_HEADERS, timeout=5)
         if res.status_code == 200:
@@ -183,9 +183,9 @@ def get_airflow_logs(run_id: str, try_number: int) -> list:
         logger.error(f"Failed to fetch logs: {e}")
     return []
 
-def get_current_try_number(run_id: str) -> int:
+def get_current_try_number(run_id: str, dag_id: str, task_id: str) -> int:
     """Gets current attempt number."""
-    url = f"{AIRFLOW_HOST}/dags/{AIRFLOW_DAG_ID}/dagRuns/{run_id}/taskInstances/{AIRFLOW_TASK_ID}"
+    url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}"
     try:
         res = requests.get(url, headers=AIRFLOW_HEADERS)
         if res.status_code == 200:
@@ -194,9 +194,10 @@ def get_current_try_number(run_id: str) -> int:
         pass
     return 1
 
-async def generate_stream_response(model: str, image_path: str, original_prompt: str) -> AsyncGenerator[str, None]:
+async def generate_stream_response(model: str, image_path: str, original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str) -> AsyncGenerator[str, None]:
     """Streaming response with Airflow logs inside a <think> block."""
     
+    task_id = AIRFLOW_TASK_ID
     # --- Start the visible <think> block ---
     think_open = "<think>\n"
     yield StreamChunk(
@@ -206,9 +207,35 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
         done=False
     ).model_dump_json() + "\n"
     try:
+        # Construct agent_headers
+        agent_headers = {
+            "X-LTAI-User": user_email,
+            "X-LTAI-Agent": model,
+            "X-LTAI-Model": model,
+            "X-LTAI-User-ID": user_id,
+            "X-LTAI-User-Role": user_role,
+            "X-LTAI-User-Name": user_name,
+            "X-LTAI-Vault-User": vault_user,
+            "X-LTAI-Vault-Keys": vault_keys,
+            "X-LTAI-Request-ID": str(uuid.uuid4())
+        }
+        # Construct chat_inputs (adapt to existing structure)
+        last_message = messages[-1] if messages else {}
+        chat_inputs = {
+            "message": last_message.get("content", ""),
+            "history": messages[:-1] if len(messages) > 1 else [],
+            "files": [{"path": image_path, "type": "image"}] if image_path else [],  # Map saved image_path as file
+            "args": {"image_path": image_path} if image_path else {},  # Preserve for DAG compatibility
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        # Final payload
+        dag_payload = {
+            "agent_headers": agent_headers,
+            "chat_inputs": chat_inputs
+        }
         # 1. Trigger the DAG
-        trigger_url = f"{AIRFLOW_HOST}/dags/{AIRFLOW_DAG_ID}/dagRuns"
-        payload = {"conf": {"image_path": image_path}}
+        trigger_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns"  # Use mapped dag_id
+        payload = {"conf": dag_payload}
 
         # Stream initial status to think block
         yield StreamChunk(
@@ -231,13 +258,13 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
             await asyncio.sleep(2) # Polling interval
             
             # Check Status
-            status_resp = requests.get(f"{AIRFLOW_HOST}/dags/{AIRFLOW_DAG_ID}/dagRuns/{dag_run_id}", headers=AIRFLOW_HEADERS)
+            status_resp = requests.get(f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}", headers=AIRFLOW_HEADERS)
             if status_resp.status_code == 200:
                 status = status_resp.json()['state']
             
             # Fetch and Stream Logs
-            try_num = get_current_try_number(dag_run_id)
-            raw_lines = get_airflow_logs(dag_run_id, try_num)
+            try_num = get_current_try_number(dag_run_id, dag_id, task_id)
+            raw_lines = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
             
             if len(raw_lines) > last_log_idx:
                 new_lines = raw_lines[last_log_idx:]
@@ -256,7 +283,7 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
                 last_log_idx = len(raw_lines)
 
         # 3. Fetch XCom Result (Hidden Logic)
-        xcom_url = f"{AIRFLOW_HOST}/dags/{AIRFLOW_DAG_ID}/dagRuns/{dag_run_id}/taskInstances/{AIRFLOW_TASK_ID}/xcomEntries/return_value"
+        xcom_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}/xcomEntries/return_value"
         xcom_resp = requests.get(xcom_url, headers=AIRFLOW_HEADERS)
         
         final_content = ""
@@ -339,18 +366,35 @@ async def root_head():
     return {}
 
 
+async def fetch_all_dags() -> List[Dict[str, Any]]:
+    url = f"{AIRFLOW_HOST}/dags"
+    async with httpx.AsyncClient(headers=AIRFLOW_HEADERS, timeout=10) as client:
+        resp = await client.get(url)
+    if resp.status_code != 200:
+        logger.error(f"Failed to fetch DAGs: status {resp.status_code}")
+        return []  # Graceful fallback to empty list
+    return resp.json().get("dags", [])
+
+def dag_to_model_entry(dag: Dict[str, Any]) -> Dict[str, Any]:
+    description = dag.get("description", dag.get("dag_id"))
+    return {
+        "name": f"clipfoundry.ai {description}",  # Prefix for display
+        "model": description,
+        "modified_at": datetime.now().isoformat(),
+        "size": 1024  # Fixed placeholder to match existing format
+    }
+
 @app.get("/api/tags")
 async def list_models():
-    return {
-        "models": [
-            {
-                "name": "clipfoundry.ai Pixora:0.3",
-                "model": "Pixora:0.3",
-                "modified_at": datetime.now().isoformat(),
-                "size": 1024
-            }
-        ]
-    }
+    dags = await fetch_all_dags()
+    chat_ready = []
+    for dag in dags:
+        tags = dag.get("tags", [])
+        is_chat_enabled = any(t.get("name") == "conversational" for t in tags)
+        is_enabled = not dag.get("is_paused", True)  # Skip paused/disabled DAGs
+        if is_chat_enabled and is_enabled:
+            chat_ready.append(dag_to_model_entry(dag))
+    return {"models": chat_ready}
 
 
 @app.get("/api/version")
@@ -371,8 +415,22 @@ async def chat_dag(request: Request):
         logger.info(f"Chat request from user: {user_email} (ID: {user_id})")
         
         messages = body.get("messages", [])
-        model = body.get("model", "image-saver:test")
+        requested_model = body.get("model")
+        if not requested_model:
+            raise HTTPException(status_code=400, detail="Model (DAG description) is required")
+        # Strip :latest if appended by client
+        model = requested_model.rstrip(":latest")
         stream = body.get("stream", False)
+        
+        # Map model (description) to actual dag_id
+        dags = await fetch_all_dags()
+        matching_dag = next((d for d in dags if d.get("description") == model), None)
+        if not matching_dag:
+            raise HTTPException(status_code=400, detail=f"Model '{requested_model}' was not found")
+        dag_id = matching_dag["dag_id"]
+        user_role = headers.get('x-openwebui-user-role', 'user')
+        vault_user = headers.get('x-ltai-vault-user', '')
+        vault_keys = headers.get('x-ltai-vault-keys', '')
         
         if not messages:
             raise HTTPException(status_code=400, detail="Messages are required")
@@ -431,13 +489,13 @@ async def chat_dag(request: Request):
             # TRIGGER DAG FLOW
             # We ignore the initial summary text for the stream and let the generator handle the response
             return StreamingResponse(
-                generate_stream_response(model, last_saved_path, user_content),
+                generate_stream_response(model, last_saved_path, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys),
                 media_type="application/x-ndjson"
             )
         elif stream and not last_saved_path:
              # Fallback for text-only streaming
              return StreamingResponse(
-                generate_stream_response(model, "", user_content), # Handle empty path case in generator if needed
+                generate_stream_response(model, "", user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys), # Handle empty path case in generator if needed
                 media_type="application/x-ndjson"
             )
         else:
@@ -465,17 +523,42 @@ async def chat_dag(request: Request):
 @app.post("/api/generate")
 async def generate(request: Request):
     body = await request.json()
-    model = body.get("model", "image-saver:test")
+    requested_model = body.get("model")
+    if not requested_model:
+        raise HTTPException(status_code=400, detail="Model is required")
+    # Strip :latest if appended
+    model = requested_model.rstrip(":latest")
+    # Map to validate existence (no DAG trigger, but consistent)
+    dags = await fetch_all_dags()
+    matching_dag = next((d for d in dags if d.get("description") == model), None)
+    if not matching_dag:
+        raise HTTPException(status_code=400, detail=f"Model '{requested_model}' was not found")
     prompt = body.get("prompt", "")
     stream = body.get("stream", False)
     
     response_text = f"This is the image-saver model. Use /api/chat endpoint to send images. Your prompt: {prompt}"
     
     if stream:
-        return StreamingResponse(
-            generate_stream_response(model, response_text),
-            media_type="application/x-ndjson"
-        )
+        async def simple_generate_stream():
+            created_at = datetime.now().isoformat()
+            words = response_text.split()
+            for i, word in enumerate(words):
+                chunk = {
+                    "model": model,  # Use stripped model
+                    "created_at": created_at,
+                    "response": word + (" " if i < len(words)-1 else ""),
+                    "done": False
+                }
+                yield json.dumps(chunk) + "\n"
+                await asyncio.sleep(0.05)
+            final = {
+                "model": model,
+                "created_at": created_at,
+                "response": "",
+                "done": True
+            }
+            yield json.dumps(final) + "\n"
+        return StreamingResponse(simple_generate_stream(), media_type="application/x-ndjson")
     else:
         return JSONResponse(content={
             "model": model,
