@@ -1,0 +1,16 @@
+users:
+  - name: sitechime
+    password: $SITECHIME_POSTGRES_PASSWORD
+    role: superuser
+
+databases:
+  - name: sitechime
+    owner: sitechime
+    tablespace:
+      - name: tb1
+        location: /appz/data/sitechime
+    schemas:
+      - name: schema_sitechime
+        authorised_user: sitechime
+        search_path: true
+

@@ -1,0 +1,14 @@
+{
+        "airflow_dags": {
+            "path": "/appz/home/airflow/dags/airflow_dags", 
+            "branch": "main",
+            "email": "mpmathew@ecloudcontrol.com",
+            "group": "data-engineering"
+        },
+        "jaffle_shop": {
+            "path": "/appz/home/airflow/dags/dbt/jaffle_shop",
+            "branch": "main",
+            "email": "mpmathew@ecloudcontrol.com",
+            "group": "sample"
+        }
+}
