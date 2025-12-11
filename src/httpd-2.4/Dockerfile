@@ -21,11 +21,8 @@ RUN a2enmod ssl proxy proxy_http rewrite headers
 # Copy SSL certificates into the container
 #COPY certs /etc/letsencrypt
 # Set permissions and ownership for certificates
-RUN chmod -R 600 /etc/letsencrypt/* && \
-    chown -R root:root /etc/letsencrypt/*
-COPY conf/api.htpasswd /etc/apache2/api.htpasswd
-RUN chmod 640 /etc/apache2/api.htpasswd
-RUN chown root:www-data /etc/apache2/api.htpasswd
+#RUN chmod -R 600 /etc/letsencrypt/* && \
+#    chown -R root:root /etc/letsencrypt/*
 
 RUN a2dissite 000-default.conf
 
@@ -45,7 +42,7 @@ RUN ARCH=$(uname -m) && \
     tar -xzvf /tmp/apache_exporter-0.11.0.*.tar.gz && \
     cp -ivr apache_exporter-0.11.0.*/apache_exporter /usr/local/bin && \
     chmod +x /usr/local/bin/apache_exporter
-ADD conf/* /etc/apache2/sites-enabled/
+#ADD conf/* /etc/apache2/sites-enabled/
 # Add scripts and configuration for exporter
 ADD scripts/exporter.sh /appz/scripts/exporter.sh
 ADD supervisor/httpd_exporter.conf /etc/supervisor/conf.d/httpd_exporter.conf

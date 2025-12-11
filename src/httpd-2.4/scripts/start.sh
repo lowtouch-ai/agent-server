@@ -2,6 +2,7 @@
 
 restore_configs() {
   CONFIG_DIR="/etc/apache2/sites-enabled"
+  CERT_DIR="/etc/letsencrypt/live/"
   PERSIST_DIR="/appz/data"
   
   mkdir -p "${CONFIG_DIR}"
@@ -17,7 +18,6 @@ restore_configs() {
     echo "No persistent configs found in ${PERSIST_DIR}"
   fi
 }
-
 if env | grep "VAULT:" > /dev/null 2>&1; then
   c=1
   mc=180
