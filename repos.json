@@ -2,7 +2,7 @@
         "https://github.com/lowtouch-ai/agent-server": {
             "path": "/appz/home/airflow/dags/agent-server",
             "branch": "main",
-            "email": ["asurendran@ecloudcontrol.com"],
+            "email": ["lowtouchai-demo@ecloudcontrol.com"],
             "group": "aiops"
         }
 }
