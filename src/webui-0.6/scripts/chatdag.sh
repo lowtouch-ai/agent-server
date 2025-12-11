@@ -1,5 +1,6 @@
 #!/bin/bash
-
+source /app/agent/venv/bin/activate
+export PATH="/app/agent/venv/bin:$PATH"
 if env |grep "VAULT:" > /dev/null 2>&1
 then
    c=1
