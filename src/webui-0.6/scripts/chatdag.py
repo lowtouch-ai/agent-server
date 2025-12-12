@@ -44,7 +44,7 @@ app.add_middleware(
 )
 
 # Configuration
-SHARED_STORAGE_PATH = os.getenv("SHARED_STORAGE_PATH", "/appz/shared/images")
+SHARED_STORAGE_PATH = os.getenv("SHARED_STORAGE_PATH", "/appz/shared/")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
@@ -154,7 +154,16 @@ def map_log_to_friendly_status(line: str) -> Optional[str]:
         return None
     
     # Skip Airflow internal framework lines
-    if any(marker in line for marker in ["Pre task execution logs", "Post task execution logs", "Log message source details"]):
+    if any(skip in line for skip in [
+        "Pre task execution logs",
+        "Post task execution logs",
+        "Log message source details",
+        "taskinstance.py",
+        "local_task_job_runner.py",
+        "airflowwkr",
+        "*** Found local files:",
+        "*** *"
+    ]):
         return None
 
     # Remove timestamp + file + level prefix like:
@@ -194,7 +203,6 @@ def get_current_try_number(run_id: str, dag_id: str, task_id: str) -> int:
 async def generate_stream_response(model: str, image_path: str, original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str) -> AsyncGenerator[str, None]:
     """Streaming response with Airflow logs inside a <think> block."""
     
-    task_id = None  # Will be dynamic
     request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4()))
     # --- Start the visible <think> block ---
     think_open = "<think>\n"
@@ -234,15 +242,6 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
         # 1. Trigger the DAG
         trigger_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns"  # Use mapped dag_id
         payload = {"conf": dag_payload}
-
-        # Stream initial status to think block
-        yield StreamChunk(
-            model=model,
-            created_at=datetime.now().isoformat(),
-            message=ChatMessage(role="assistant", content=f"🚀 Triggering Image Processor DAG for: {os.path.basename(image_path)}...\n"),
-            done=False
-        ).model_dump_json() + "\n"
-
         resp = requests.post(trigger_url, headers=AIRFLOW_HEADERS, json=payload, timeout=10)
         resp.raise_for_status()
         dag_run_id = resp.json()['dag_run_id']
@@ -252,7 +251,9 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
         ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
         task_instances = ti_resp.json().get("task_instances", []) if ti_resp.status_code == 200 else []
 
-        seen_tasks = set()
+        # Track log progress per task
+        last_log_counts = {ti["task_id"]: 0 for ti in task_instances}
+        completed_tasks = set()
         last_success_task = None
 
         status = "running"
@@ -267,48 +268,48 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
             # Poll each task
             for ti in task_instances:
                 task_id = ti["task_id"]
-                state = ti.get("state", "scheduled")
-
-                if task_id in seen_tasks:
+                task_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}"
+                task_resp = requests.get(task_url, headers=AIRFLOW_HEADERS)
+                if task_resp.status_code != 200:
                     continue
+                task_info = task_resp.json()
+                current_state = task_info.get("state")
+                try_num = task_info.get("try_number", 1)
 
-                if state in ["running", "queued"]:
+                # Emit "started" only once
+                if current_state in ["running", "queued"] and task_id not in completed_tasks:
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
                         message=ChatMessage(role="assistant", content=f"Task `{task_id}` started\n"),
                         done=False
                     ).model_dump_json() + "\n"
-                    seen_tasks.add(task_id)
 
-                # Refresh task instance state
-                latest = requests.get(f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}", headers=AIRFLOW_HEADERS)
-                if latest.status_code == 200:
-                    current_state = latest.json().get("state")
-                    try_num = latest.json().get("try_number", 1)
+                # Stream new logs
+                logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
+                new_logs = logs[last_log_counts[task_id]:]
+                last_log_counts[task_id] = len(logs)
 
-                    if current_state == "success" and task_id not in seen_tasks:
+                for line in new_logs:
+                    clean = map_log_to_friendly_status(line)
+                    if clean:
                         yield StreamChunk(
                             model=model,
                             created_at=datetime.now().isoformat(),
-                            message=ChatMessage(role="assistant", content=f"Task `{task_id}` completed\n"),
+                            message=ChatMessage(role="assistant", content=f"{clean}\n"),
                             done=False
                         ).model_dump_json() + "\n"
-                        last_success_task = task_id
-                        seen_tasks.add(task_id)
 
-                    # Stream logs while task is running
-                    if current_state in ["running", "queued"]:
-                        logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
-                        for line in logs[-20:]:  # last 20 lines
-                            clean = map_log_to_friendly_status(line)
-                            if clean:
-                                yield StreamChunk(
-                                    model=model,
-                                    created_at=datetime.now().isoformat(),
-                                    message=ChatMessage(role="assistant", content=f"{clean}\n"),
-                                    done=False
-                                ).model_dump_json() + "\n"
+                # Emit "completed" only once
+                if current_state == "success" and task_id not in completed_tasks:
+                    yield StreamChunk(
+                        model=model,
+                        created_at=datetime.now().isoformat(),
+                        message=ChatMessage(role="assistant", content=f"Task `{task_id}` completed\n\n"),
+                        done=False
+                    ).model_dump_json() + "\n"
+                    last_success_task = task_id
+                    completed_tasks.add(task_id)
 
         # Final XCom from last successful task
         final_content = "DAG completed but no result found."
@@ -328,17 +329,9 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
                     )
                 else:
                     final_content = f"**Processing Failed**: {data.get('message')}"
-            else:
-                final_content = "DAG finished, but result retrieval failed."
 
     except Exception as e:
         logger.error(f"Workflow failed: {str(e)}")
-        yield StreamChunk(
-            model=model,
-            created_at=datetime.now().isoformat(),
-            message=ChatMessage(role="assistant", content=f"Error executing workflow: {str(e)}\n"),
-            done=False
-        ).model_dump_json() + "\n"
         final_content = f"System Error: {str(e)}"
         
     # --- Close the <think> block ---
