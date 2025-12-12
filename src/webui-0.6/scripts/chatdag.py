@@ -319,16 +319,22 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
             if xcom_resp.status_code == 200:
                 raw = xcom_resp.json().get("value")
                 data = ast.literal_eval(raw) if isinstance(raw, str) else raw
-                if data.get("status") == "success":
-                    final_content = (
-                        f"**Processing Complete**\n\n"
-                        f"The image `{os.path.basename(data.get('image_path', ''))}` was verified successfully.\n"
-                        f"**Details:**\n"
-                        f"* File Size: {data.get('file_size')} bytes\n"
-                        f"* Verification: {data.get('message')}"
-                    )
+                
+                if isinstance(data, dict) and data.get("status") == "success":
+                    
+                    # --- NEW LOGIC: JUST PRINT THE DAG'S OUTPUT ---
+                    if "markdown_output" in data:
+                        final_content = data["markdown_output"]
+                    
+                    # Fallback for Image Saver
+                    elif "file_size" in data:
+                        final_content = f"**Image Saved**\nFile: `{os.path.basename(data.get('image_path', ''))}`\nSize: {data.get('file_size')} bytes"
+                        
+                    else:
+                        final_content = f"**Success:**\n{json.dumps(data, indent=2)}"
                 else:
-                    final_content = f"**Processing Failed**: {data.get('message')}"
+                    msg = data.get('message') if isinstance(data, dict) else str(data)
+                    final_content = f"**Processing Failed**: {msg}"
 
     except Exception as e:
         logger.error(f"Workflow failed: {str(e)}")
@@ -343,21 +349,19 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
         done=False
     ).model_dump_json() + "\n"
 
-    # 4. Stream the Final Response
-    words = final_content.split()
-    chunk_size = 5
+    # 4. Stream the Final Response (Preserving Markdown Formatting)
+    # We chunk by characters instead of splitting by words to preserve newlines (\n)
     
-    for i in range(0, len(words), chunk_size):
-        chunk_words = words[i:i + chunk_size]
-        chunk_content = " " + " ".join(chunk_words) if i > 0 else " ".join(chunk_words)
-
+    chunk_size = 50  # Send 50 characters at a time
+    for i in range(0, len(final_content), chunk_size):
+        chunk = final_content[i:i+chunk_size]
         yield StreamChunk(
             model=model,
             created_at=datetime.now().isoformat(),
-            message=ChatMessage(role="assistant", content=chunk_content),
+            message=ChatMessage(role="assistant", content=chunk),
             done=False
         ).model_dump_json() + "\n"
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.01)
     
     # --- Final done chunk ---
     final = FinalResponse(
