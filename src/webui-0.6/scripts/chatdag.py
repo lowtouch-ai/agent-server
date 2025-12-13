@@ -44,12 +44,15 @@ app.add_middleware(
 
 # Configuration
 SHARED_STORAGE_PATH = os.getenv("SHARED_STORAGE_PATH", "/appz/shared/")
+VIDEO_OUTPUT_DIR = os.getenv("VIDEO_OUTPUT_DIR", "/app/backend/open_webui/static/videos")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
 # Ensure storage directory exists
 Path(SHARED_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
+Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 logger.info(f"Image storage path: {SHARED_STORAGE_PATH}")
+logger.info(f"Video output path: {VIDEO_OUTPUT_DIR}")
 
 
 class ChatMessage(BaseModel):
@@ -326,6 +329,17 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                     # --- NEW LOGIC: JUST PRINT THE DAG'S OUTPUT ---
                     if "markdown_output" in data:
                         final_content = data["markdown_output"]
+                    
+                    elif "video_path" in data:
+                        vid_path = data["video_path"]
+                        filename = os.path.basename(vid_path)
+                        download_link = f"/static/videos/{filename}"
+                        
+                        final_content = (
+                            f"### 🎬 Video Ready!\n\n"
+                            f"Your video has been generated successfully.\n\n"
+                            f"[**⬇️ Click here to Download/Watch Video**]({download_link})"
+                        )
                     
                     # Fallback for Image Saver
                     elif "file_size" in data:
