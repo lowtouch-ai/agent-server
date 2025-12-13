@@ -25,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 # --- AIRFLOW CONFIGURATION ---
 AIRFLOW_HOST = os.getenv("AIRFLOW_HOST")
-AIRFLOW_TASK_ID = "generate_final_report"
 AIRFLOW_API_KEY = os.getenv("AIRFLOW_API_KEY") 
 AIRFLOW_HEADERS = {
     "Authorization": f"Basic {AIRFLOW_API_KEY}",
@@ -200,7 +199,7 @@ def get_current_try_number(run_id: str, dag_id: str, task_id: str) -> int:
         pass
     return 1
 
-async def generate_stream_response(model: str, image_path: str, original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str) -> AsyncGenerator[str, None]:
+async def generate_stream_response(model: str, image_paths: List[str], original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str) -> AsyncGenerator[str, None]:
     """Streaming response with Airflow logs inside a <think> block."""
     
     request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4()))
@@ -227,11 +226,13 @@ async def generate_stream_response(model: str, image_path: str, original_prompt:
         }
         # Construct chat_inputs (adapt to existing structure)
         last_message = messages[-1] if messages else {}
+        # Map all paths to the file object structure
+        files_list = [{"path": p, "type": "image"} for p in image_paths]
         chat_inputs = {
             "message": last_message.get("content", ""),
             "history": messages[:-1] if len(messages) > 1 else [],
-            "files": [{"path": image_path, "type": "image"}] if image_path else [],  # Map saved image_path as file
-            "args": {"image_path": image_path} if image_path else {},  # Preserve for DAG compatibility
+            "files": files_list,
+            "args": {"image_path": image_paths[0]} if image_paths else {},  # Preserve for DAG compatibility
             "timestamp": datetime.utcnow().isoformat()
         }
         # Final payload
@@ -468,7 +469,7 @@ async def chat_dag(request: Request):
         
         response_parts = []
         saved_images = []
-        last_saved_path = None  # Track the path for the DAG
+        saved_paths = []
         
         if images:
             response_parts.append(f"👤 Hello {user_name}! I received {len(images)} image(s).\n")
@@ -479,7 +480,7 @@ async def chat_dag(request: Request):
                     save_info = save_image(image_bytes, request_id, metadata)
                     saved_images.append(save_info)
                     # Capture the absolute path for the DAG
-                    last_saved_path = save_info['path']
+                    saved_paths.append(save_info['path'])
                     
                     response_parts.append(
                         f"\n📸 **Image {idx} Saved Successfully:**\n"
@@ -510,14 +511,14 @@ async def chat_dag(request: Request):
         
         response_content = "".join(response_parts)
         
-        if stream and last_saved_path:
+        if stream and saved_paths:
             # TRIGGER DAG FLOW
             # We ignore the initial summary text for the stream and let the generator handle the response
             return StreamingResponse(
-                generate_stream_response(model, last_saved_path, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys),
+                generate_stream_response(model, saved_paths, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys),
                 media_type="application/x-ndjson"
             )
-        elif stream and not last_saved_path:
+        elif stream and not saved_paths:
              # Fallback for text-only streaming
              return StreamingResponse(
                 generate_stream_response(model, "", user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys), # Handle empty path case in generator if needed
