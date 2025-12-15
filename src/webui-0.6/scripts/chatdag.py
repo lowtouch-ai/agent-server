@@ -18,6 +18,7 @@ import requests
 import re
 import ast
 import httpx
+import shutil
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -43,8 +44,8 @@ app.add_middleware(
 )
 
 # Configuration
-SHARED_STORAGE_PATH = os.getenv("SHARED_STORAGE_PATH", "/appz/shared/")
-VIDEO_OUTPUT_DIR = os.getenv("VIDEO_OUTPUT_DIR", "/app/backend/open_webui/static/videos")
+SHARED_STORAGE_PATH = os.getenv("SHARED_STORAGE_PATH")
+VIDEO_OUTPUT_DIR = os.getenv("VIDEO_OUTPUT_DIR")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
@@ -87,6 +88,26 @@ class FinalResponse(BaseModel):
     eval_count: int
     eval_duration: int
 
+def save_video_to_static_dir(source_video_path: str) -> str:
+    """Save or copy the video to the static videos directory and return the relative path."""
+    try:
+        if not Path(source_video_path).exists():
+            raise ValueError(f"Source video path does not exist: {source_video_path}")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"video_{timestamp}_{unique_id}.mp4"  # Assuming MP4; adjust if needed
+        
+        target_path = Path(VIDEO_OUTPUT_DIR) / filename
+        shutil.copy2(source_video_path, target_path)  # Copy to preserve metadata
+        
+        relative_path = f"/static/videos/{filename}"
+        logger.info(f"Video saved/copied to: {relative_path}")
+        
+        return relative_path
+    except Exception as e:
+        logger.error(f"Failed to save video to static dir: {str(e)}")
+        raise
 
 def verify_and_decode_image(base64_image: str) -> tuple:
     """Verify and decode a base64 image."""
@@ -332,8 +353,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                     
                     elif "video_path" in data:
                         vid_path = data["video_path"]
-                        filename = os.path.basename(vid_path)
-                        video_url = f"/static/videos/{filename}"
+                        video_url = save_video_to_static_dir(vid_path)
                         
                         final_content = (
                             f"### 🎬 Video Ready!\n\n"
@@ -564,124 +584,6 @@ async def chat_dag(request: Request):
         logger.error(f"Error in chat endpoint: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
-@app.post("/api/generate")
-async def generate(request: Request):
-    body = await request.json()
-    requested_model = body.get("model")
-    if not requested_model:
-        raise HTTPException(status_code=400, detail="Model is required")
-    # Strip :latest if appended
-    model = requested_model.rstrip(":latest")
-    # Map to validate existence (no DAG trigger, but consistent)
-    dags = await fetch_all_dags()
-    matching_dag = next((d for d in dags if d.get("description") == model), None)
-    if not matching_dag:
-        raise HTTPException(status_code=400, detail=f"Model '{requested_model}' was not found")
-    prompt = body.get("prompt", "")
-    stream = body.get("stream", False)
-    
-    response_text = f"This is the image-saver model. Use /api/chat endpoint to send images. Your prompt: {prompt}"
-    
-    if stream:
-        async def simple_generate_stream():
-            created_at = datetime.now().isoformat()
-            words = response_text.split()
-            for i, word in enumerate(words):
-                chunk = {
-                    "model": model,  # Use stripped model
-                    "created_at": created_at,
-                    "response": word + (" " if i < len(words)-1 else ""),
-                    "done": False
-                }
-                yield json.dumps(chunk) + "\n"
-                await asyncio.sleep(0.05)
-            final = {
-                "model": model,
-                "created_at": created_at,
-                "response": "",
-                "done": True
-            }
-            yield json.dumps(final) + "\n"
-        return StreamingResponse(simple_generate_stream(), media_type="application/x-ndjson")
-    else:
-        return JSONResponse(content={
-            "model": model,
-            "created_at": datetime.now().isoformat(),
-            "response": response_text,
-            "done": True
-        })
-
-
-@app.get("/api/images/list")
-async def list_saved_images(user_id: Optional[str] = None):
-    try:
-        search_path = Path(SHARED_STORAGE_PATH) / user_id if user_id else Path(SHARED_STORAGE_PATH)
-        
-        if not search_path.exists():
-            return {"images": [], "count": 0, "storage_path": str(search_path)}
-        
-        images = []
-        for file_path in search_path.rglob("*"):
-            if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS:
-                stat = file_path.stat()
-                images.append({
-                    "filename": file_path.name,
-                    "relative_path": str(file_path.relative_to(SHARED_STORAGE_PATH)),
-                    "size_bytes": stat.st_size,
-                    "size_kb": round(stat.st_size / 1024, 2),
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    "user_folder": file_path.parent.name
-                })
-        
-        images.sort(key=lambda x: x['modified_at'], reverse=True)
-        total_size = sum(img['size_bytes'] for img in images)
-        
-        return {
-            "images": images,
-            "count": len(images),
-            "total_size_kb": round(total_size / 1024, 2),
-            "total_size_mb": round(total_size / (1024 * 1024), 2),
-            "storage_path": str(search_path)
-        }
-    except Exception as e:
-        logger.error(f"Error listing images: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
-
-@app.get("/api/images/stats")
-async def get_storage_stats():
-    try:
-        storage_path = Path(SHARED_STORAGE_PATH)
-        
-        if not storage_path.exists():
-            return {"status": "storage_not_initialized", "path": str(storage_path)}
-        
-        total_files = 0
-        total_size = 0
-        users = set()
-        
-        for file_path in storage_path.rglob("*"):
-            if file_path.is_file() and file_path.suffix.lower() in ALLOWED_EXTENSIONS:
-                total_files += 1
-                total_size += file_path.stat().st_size
-                try:
-                    user_folder = file_path.relative_to(storage_path).parts[0]
-                    users.add(user_folder)
-                except IndexError:
-                    pass
-        
-        return {
-            "status": "active",
-            "storage_path": str(storage_path),
-            "total_images": total_files,
-            "total_users": len(users),
-            "total_size_bytes": total_size,
-            "total_size_mb": round(total_size / (1024 * 1024), 2),
-            "users": sorted(list(users))
-        }
-    except Exception as e:
-        logger.error(f"Error getting stats: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @app.get("/health")
