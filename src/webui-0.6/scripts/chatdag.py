@@ -169,37 +169,19 @@ def save_image(image_bytes: bytes, user_id: str, metadata: dict) -> dict:
 
 def map_log_to_friendly_status(line: str) -> Optional[str]:
     """
-    Now returns the raw log message (without timestamp, file, level prefix).
-    Returns None only for empty or irrelevant lines.
+    Strictly filters logs to only return messages prefixed with 'Thinking: '.
     """
     line = line.strip()
     if not line:
         return None
     
-    # Skip Airflow internal framework lines
-    if any(skip in line for skip in [
-        "Pre task execution logs",
-        "Post task execution logs",
-        "Log message source details",
-        "taskinstance.py",
-        "local_task_job_runner.py",
-        "airflowwkr",
-        "*** Found local files:",
-        "*** *"
-    ]):
-        return None
+    # We look for the tag regardless of log levels (INFO, WARNING, etc.)
+    TOKEN = "Thinking:"
+    if TOKEN in line:
+        # Split on the token and return everything after it
+        return line.split(TOKEN, 1)[1].strip()
 
-    # Remove timestamp + file + level prefix like:
-    # [2025-12-11, 19:49:20 UTC] {clipfoundry-image-retrieval.py:19} INFO - 
-    if "INFO -" in line:
-        return line.split("INFO -", 1)[-1].strip()
-    if "ERROR" in line:
-        return line.split("ERROR", 1)[-1].strip()
-    if "WARNING" in line:
-        return line.split("WARNING", 1)[-1].strip()
-
-    # Fallback: return the whole line if no level found (e.g. "Done. Returned value was: ...")
-    return line
+    return None
 
 def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str) -> list:
     """Fetches and cleans logs for the specific task run."""
@@ -278,8 +260,8 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
 
         # Track log progress per task
         last_log_counts = {ti["task_id"]: 0 for ti in task_instances}
-        completed_tasks = set()
-        last_success_task = None
+        started_tasks = set()     # Tracks 'Started {task}'
+        completed_tasks = set()   # Tracks 'Completed {task}'
 
         status = "running"
         while status in ["queued", "running"]:
@@ -302,13 +284,16 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                 try_num = task_info.get("try_number", 1)
 
                 # Emit "started" only once
-                if current_state in ["running", "queued"] and task_id not in completed_tasks:
+                # We check if task is running/queued/success and hasn't been announced yet
+                is_active = current_state in ["running", "queued", "success", "failed", "upstream_failed"]
+                if is_active and task_id not in started_tasks:
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
-                        message=ChatMessage(role="assistant", content=f"Task `{task_id}` started\n"),
+                        message=ChatMessage(role="assistant", content=f"Started `{task_id}`\n"),
                         done=False
                     ).model_dump_json() + "\n"
+                    started_tasks.add(task_id)
 
                 # Stream new logs
                 logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
@@ -325,12 +310,12 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                             done=False
                         ).model_dump_json() + "\n"
 
-                # Emit "completed" only once
-                if current_state == "success" and task_id not in completed_tasks:
+                # 2. Emit "Completed" ONCE when task succeeds/fails
+                if current_state in ["success", "failed", "skipped"] and task_id not in completed_tasks:
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
-                        message=ChatMessage(role="assistant", content=f"Task `{task_id}` completed\n\n"),
+                        message=ChatMessage(role="assistant", content=f"Completed `{task_id}`\n"),
                         done=False
                     ).model_dump_json() + "\n"
                     last_success_task = task_id
@@ -361,7 +346,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                             f'<video width="100%" controls>\n'
                             f'  <source src="{video_url}" type="video/mp4">\n'
                             f'  Your browser does not support the video tag.\n'
-                            f'</video>\n\n'
+                            f'</video>\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
                     
