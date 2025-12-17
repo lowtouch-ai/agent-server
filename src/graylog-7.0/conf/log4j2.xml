@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration packages="org.graylog2.log4j" shutdownHook="disable">
+<Appenders>
+<!-- Simple appender that writes access log to specified file -->
+<File name="RestAccessLog" fileName="/appz/log/audit/audit.log" append="true">
+<PatternLayout pattern="%d %-5p: %c - %m%n"/>
+</File>
+</Appenders>
+<Loggers>
+<!-- RestAccessLogFilter -->
+<Logger name="org.graylog2.rest.accesslog" level="debug" additivity="false">
+<AppenderRef ref="RestAccessLog" level="debug"/>
+</Logger>
+</Loggers>
+</Configuration>

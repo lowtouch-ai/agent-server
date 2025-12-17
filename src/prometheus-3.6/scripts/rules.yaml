@@ -1,0 +1,22 @@
+groups:
+- name: airflow_recording
+  rules:
+  - record: airflow_ti_failures_extracted
+    expr: |
+      label_replace(
+        {__name__=~"airflow_ti_finish_.+_failed"},
+        "dag_id", "$1",
+        "__name__", "airflow_ti_finish_(.+)_failed"
+      )
+
+- name: airflow_alerts
+  rules:
+  - alert: AirflowDagFailure
+    expr: rate(airflow_ti_failures_extracted[1m]) > 0
+    for: 0s
+    labels:
+      severity: critical
+    annotations:
+      summary: "Airflow DAG Failure Detected"
+      description: |
+        :rotating_light: DAG_ID: {{ $labels.dag_id }}

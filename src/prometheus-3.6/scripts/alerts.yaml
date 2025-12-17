@@ -1,0 +1,229 @@
+groups:
+
+- name: Cpu-usage
+  rules:
+  - alert: HostHighCpuLoad
+    expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[2m])) * 100) > 95
+    for: 3m
+    labels:
+      severity: warning
+    annotations:
+      summary: Host high CPU load (instance {{ $labels.instance }})
+      description: "CPU load is > 95%\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+
+- name: Disk-usage
+  rules:
+  - alert: 'Low data disk space'
+    expr: ceil(((node_filesystem_size_bytes{mountpoint!="/boot"} - node_filesystem_free_bytes{mountpoint!="/boot"}) / node_filesystem_size_bytes{mountpoint!="/boot"} * 100)) > 95
+    labels:
+      severity: 'critical'
+    annotations:
+      title: "Disk Usage"
+      description: 'Partition : {{$labels.mountpoint}}'
+      summary: "Disk usage is `{{humanize $value}}%`"
+      host: "{{$labels.instance}}"
+
+
+- name: Memory-usage
+  rules:
+  - alert: HostOutOfMemory
+    expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100 < 10
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: Host out of memory (instance {{ $labels.instance }})
+      description: "Node memory is filling up (< 10% left)\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: Disk-usage-check
+  rules:
+  - alert: Host Out Of DiskSpace
+    expr: (node_filesystem_avail_bytes * 100) / node_filesystem_size_bytes < 15 and ON (instance, device, mountpoint) node_filesystem_readonly == 0
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      title: "Low Disk space"
+      summary: Host out of disk space (instance {{ $labels.instance }})
+      description: "Disk is getting full (< 15% left)\n  Available Space is only= {{ $value }} %\n  LABELS = {{ $labels }}"
+
+- name: High-Pod-CPU
+  rules:
+  - alert: HighPodCPU
+    expr: avg(rate(container_cpu_usage_seconds_total{namespace!="",image!="",container_name!="POD"}[5m])*100) by (pod,namespace  )  > 90
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: HighCpuUsage
+      description: "Pod cpu average value : {{ $value | printf \"%.2f\" }}"
+- name: CPU-load
+  rules:
+  - alert: HighNodeCPU
+    expr: node_load15 / count by (instance, job) (node_cpu_seconds_total{mode="idle"}) >=5
+    for : 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU load (instance {{ $labels.instance }})"
+      description: "CPU load is high\n  VALUE = {{ $value }}\n  LABELS: {{ $labels }}"
+
+- name: SSL-Expire-30Days
+  rules:
+  - alert: BlackboxSslCertificateWillExpireSoon
+    expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 30
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: Blackbox SSL certificate will expire soon (instance {{ $labels.instance }})
+      description: "SSL certificate expires in 30 days\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: SSL-Expire-7Days
+  rules:
+  - alert: BlackboxSslCertificateWillExpireSoon
+    expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 7
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: Blackbox SSL certificate will expire soon (instance {{ $labels.instance }})
+      description: "SSL certificate expires in 3 days\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: SSL-Expired
+  rules:
+  - alert: BlackboxSslCertificateExpired
+    expr: probe_ssl_earliest_cert_expiry - time() <= 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: Blackbox SSL certificate expired (instance {{ $labels.instance }})
+      description: "SSL certificate has expired already\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: slow-http-1sec
+  rules:
+  - alert: BlackboxProbeSlowHttp
+    expr: avg_over_time(probe_http_duration_seconds[1m]) > 1
+    for: 100m
+    labels:
+      severity: warning
+    annotations:
+      summary: Blackbox probe slow HTTP (instance {{ $labels.instance }})
+      description: "HTTP request took more than 1s\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+
+- name: slow-http-3sec
+  rules:
+  - alert: BlackboxProbeSlowHttp
+    expr: avg_over_time(probe_http_duration_seconds[1m]) > 3
+    for: 100m
+    labels:
+      severity: critical
+    annotations:
+      summary: Blackbox probe slow HTTP (instance {{ $labels.instance }})
+      description: "HTTP request took more than 3s\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: site-down
+  rules:
+  - alert: SiteDown
+    expr: probe_success == 0
+    for: 5m
+    labels:
+      severity: "critical"
+    annotations:
+      summary: "Site {{ $labels.instance }} down"
+      description: "HTTP probe fail"
+
+- name: status-other-than-200
+  rules:
+  - alert: http-200-fail
+    expr: probe_http_status_code != 200
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "HTTP 200 Fail"
+      description: "HTTP status code other than \"200\" has been returned\n HTTP STATUS {{ $value }}"
+
+- name: MongodbDown
+  rules:
+  - alert: MongodbDown
+    expr: mongodb_up == 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: MongoDB Down (instance {{ $labels.pod }})
+      description: "MongoDB instance is down\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: MongodbReplicaMemberUnhealthy
+  rules:
+  - alert: MongodbReplicaMemberUnhealthy
+    expr: mongodb_mongod_replset_member_health == 0
+    for: 0m
+    labels:
+      severity: critical
+    annotations:
+      summary: Mongodb replica member unhealthy (instance {{ $labels.pod }})
+      description: "MongoDB replica member is not healthy\n  VALUE = {{ $value }}\n  LABELS = {{ $labels }}"
+
+- name: MongodbReplicationLag
+  rules:
+  - alert: MongoDBReplicationLagHigh
+    expr: max_over_time(mongodb_mongod_replset_member_optime_date{state="PRIMARY"}[5m]) - mongodb_mongod_replset_member_optime_date{state="SECONDARY"} > 10000
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: High MongoDB Replication Lag Detected
+      description: "Replication lag in MongoDB is currently {{ $value }} milliseconds, which is above the threshold of 10,000 milliseconds."
+
+- name: Pods-High-DiskUsage
+  rules:
+  - alert: PodsHighDU
+    expr: 100 - (100 * (filesystem_available_size_bytes / filesystem_total_size_bytes))  > 90
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: HighDiskUsage
+      description: "Pod disk usage percent value : {{ $value | printf \"%.2f\" }}"
+
+- name: Pod-Scaling-Up
+  rules:
+  - alert: PodScaleUp
+    expr: |
+      ( kube_deployment_status_replicas_available{deployment!="", namespace!=""} - kube_deployment_status_replicas_available{deployment!="", namespace!=""} offset 5m) > 0
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Deployment scale up observed"
+      description: |
+        Observed scale up in deployment {{ $labels.deployment }}. Current Replica count is : {{ with printf "kube_deployment_status_replicas_available{deployment='%s',namespace='%s'}" $labels.deployment $labels.namespace | query }} {{ . | first | value | humanize1024 }} {{ end }}
+
+- name: High-Pod-Memory
+  rules:
+  - alert: PodMemoryHigh
+    expr: sum(container_memory_usage_bytes{image!="", pod=~".*"}) by (namespace, pod) / sum(kube_pod_container_resource_limits_memory_bytes{}) by (namespace, pod) * 100 > 70
+    for: 3m
+    labels:
+      severity: critical
+    annotations:
+      summary: HighPodMemoryUsage
+      description: "Pod Memory usage exceeds 70% for pod {{$labels.pod}} under {{$labels.namespace}} namespace"
+        
+- name: Pod-Scaling-Down
+  rules:
+  - alert: PodScaleDown
+    expr: |
+      ( kube_deployment_status_replicas_available{deployment!="", namespace!=""} - kube_deployment_status_replicas_available{deployment!="", namespace!=""} offset 5m ) < 0
+    for: 1m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Deployment scale down observed"
+      description: |
+        Observed scale down in deployment {{ $labels.deployment }}. Current Replica count is : {{ with printf "kube_deployment_status_replicas_available{deployment='%s',namespace='%s'}" $labels.deployment $labels.namespace | query }} {{ . | first | value | humanize1024 }} {{ end }}
