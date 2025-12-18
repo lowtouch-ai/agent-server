@@ -46,14 +46,20 @@ app.add_middleware(
 # Configuration
 SHARED_STORAGE_PATH = os.getenv("SHARED_STORAGE_PATH")
 VIDEO_OUTPUT_DIR = os.getenv("VIDEO_OUTPUT_DIR")
+CACHE_ROOT = os.getenv("CACHE_DIR")
+LOGS_ROOT = os.getenv("LOGS_DIR")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
 # Ensure storage directory exists
 Path(SHARED_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(CACHE_ROOT).mkdir(parents=True, exist_ok=True)
+Path(LOGS_ROOT).mkdir(parents=True, exist_ok=True)
 logger.info(f"Image storage path: {SHARED_STORAGE_PATH}")
 logger.info(f"Video output path: {VIDEO_OUTPUT_DIR}")
+logger.info(f"Cache path: {CACHE_ROOT}")
+logger.info(f"Logs path: {LOGS_ROOT}")
 
 
 class ChatMessage(BaseModel):
@@ -91,15 +97,23 @@ class FinalResponse(BaseModel):
 def save_video_to_static_dir(source_video_path: str) -> str:
     """Save or copy the video to the static videos directory and return the relative path."""
     try:
-        if not Path(source_video_path).exists():
-            raise ValueError(f"Source video path does not exist: {source_video_path}")
+        source = Path(source_video_path)
+        
+        if not source.exists():
+            clean_rel = str(source).lstrip("/") 
+            source = Path(SHARED_STORAGE_PATH) / clean_rel
+            
+        if not source.exists():
+            logger.error(f"File not found. Checked: {source_video_path} AND {source}")
+            raise ValueError(f"Source video not found at: {source_video_path}")
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         filename = f"video_{timestamp}_{unique_id}.mp4"  # Assuming MP4; adjust if needed
         
         target_path = Path(VIDEO_OUTPUT_DIR) / filename
-        shutil.copy2(source_video_path, target_path)  # Copy to preserve metadata
+        logger.info(f"Copying video: {source} -> {target_path}")
+        shutil.copy2(source, target_path)
         
         relative_path = f"/static/videos/{filename}"
         logger.info(f"Video saved/copied to: {relative_path}")
@@ -132,8 +146,8 @@ def verify_and_decode_image(base64_image: str) -> tuple:
         raise ValueError(f"Invalid image: {str(e)}")
 
 
-def save_image(image_bytes: bytes, user_id: str, metadata: dict) -> dict:
-    """Save image to shared storage."""
+def save_image(image_bytes: bytes, destination_dir: Path, metadata: dict) -> dict:
+    """Save image to specific directory."""
     try:
         format_to_ext = {
             "JPEG": ".jpg", "PNG": ".png", "GIF": ".gif",
@@ -145,10 +159,7 @@ def save_image(image_bytes: bytes, user_id: str, metadata: dict) -> dict:
         unique_id = str(uuid.uuid4())[:8]
         filename = f"img_{timestamp}_{unique_id}{file_ext}"
         
-        user_dir = Path(SHARED_STORAGE_PATH) / user_id
-        user_dir.mkdir(parents=True, exist_ok=True)
-        
-        file_path = user_dir / filename
+        file_path = destination_dir / filename
         with open(file_path, "wb") as f:
             f.write(image_bytes)
         
@@ -167,20 +178,46 @@ def save_image(image_bytes: bytes, user_id: str, metadata: dict) -> dict:
         raise
 
 
-def map_log_to_friendly_status(line: str) -> Optional[str]:
+def map_log_to_friendly_status(line: str, is_internal: bool = False) -> Optional[str]:
     """
-    Strictly filters logs to only return messages prefixed with 'Thinking: '.
+    Filters logs:
+    - Always returns messages with 'Thinking:'.
+    - If is_internal is True, returns filtered debug logs (no italics).
     """
     line = line.strip()
     if not line:
         return None
     
-    # We look for the tag regardless of log levels (INFO, WARNING, etc.)
+    # 1. Always show Thinking logs (High Priority)
     TOKEN = "Thinking:"
     if TOKEN in line:
         # Split on the token and return everything after it
         return line.split(TOKEN, 1)[1].strip()
 
+    # 2. Filter logic for Internal Users
+    if is_internal:
+        # Aggressive blacklist for Airflow system noise
+        IGNORE_PATTERNS = [
+            "Error fetching the logs", "default_host",
+            "::group::", "::endgroup::",
+            "AIRFLOW_CTX_", "Exporting env vars",
+            "Pre task execution logs", "Post task execution logs",
+            "Dependencies all met", "Starting attempt",
+            "Executing <Task", "Started process",
+            "Running: ['", "Subtask",
+            "Running <TaskInstance", "Task exited with return code",
+            "Marking task as SUCCESS", "downstream tasks scheduled",
+            "Following branch", "Branch into",
+            "Skipping tasks", "cannot be called outside TaskInstance",
+            "Returned value was", "***"
+        ]
+        
+        # If line contains any ignored pattern, skip it
+        if any(pattern in line for pattern in IGNORE_PATTERNS):
+            return None
+            
+        # Return clean log line
+        return line
     return None
 
 def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str) -> list:
@@ -205,10 +242,25 @@ def get_current_try_number(run_id: str, dag_id: str, task_id: str) -> int:
         pass
     return 1
 
-async def generate_stream_response(model: str, image_paths: List[str], original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str) -> AsyncGenerator[str, None]:
+async def get_task_docs(dag_id: str) -> Dict[str, str]:
+    """Fetches task definitions to map task_ids to doc_md (friendly names)."""
+    url = f"{AIRFLOW_HOST}/dags/{dag_id}/tasks"
+    try:
+        async with httpx.AsyncClient(headers=AIRFLOW_HEADERS, timeout=5) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                tasks = resp.json().get("tasks", [])
+                return {t["task_id"]: t.get("doc_md") for t in tasks}
+    except Exception as e:
+        logger.warning(f"Could not fetch task docs: {e}")
+    return {}
+
+async def generate_stream_response(model: str, image_paths: List[str], original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str, chat_id: Dict[str, Any]) -> AsyncGenerator[str, None]:
     """Streaming response with Airflow logs inside a <think> block."""
     
     request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4()))
+    is_internal = "ecloudcontrol.com" in user_email or user_role == "admin"
+    task_docs = await get_task_docs(dag_id)
     # --- Start the visible <think> block ---
     think_open = "<think>\n"
     yield StreamChunk(
@@ -239,7 +291,8 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             "history": messages[:-1] if len(messages) > 1 else [],
             "files": files_list,
             "args": {"image_path": image_paths[0]} if image_paths else {},  # Preserve for DAG compatibility
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "chat_id": chat_id
         }
         # Final payload
         dag_payload = {
@@ -287,10 +340,14 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                 # We check if task is running/queued/success and hasn't been announced yet
                 is_active = current_state in ["running", "queued", "success", "failed", "upstream_failed"]
                 if is_active and task_id not in started_tasks:
+                    friendly_name = task_docs.get(task_id) or task_id
+                    
+                    # Show technical ID only to internal users
+                    display_name = f"{friendly_name} (`{task_id}`)" if is_internal else friendly_name
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
-                        message=ChatMessage(role="assistant", content=f"Started `{task_id}`\n"),
+                        message=ChatMessage(role="assistant", content=f"**{display_name}**...\n"),
                         done=False
                     ).model_dump_json() + "\n"
                     started_tasks.add(task_id)
@@ -301,7 +358,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                 last_log_counts[task_id] = len(logs)
 
                 for line in new_logs:
-                    clean = map_log_to_friendly_status(line)
+                    clean = map_log_to_friendly_status(line, is_internal=is_internal)
                     if clean:
                         yield StreamChunk(
                             model=model,
@@ -312,10 +369,14 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
 
                 # 2. Emit "Completed" ONCE when task succeeds/fails
                 if current_state in ["success", "failed", "skipped"] and task_id not in completed_tasks:
+                    friendly_name = task_docs.get(task_id) or task_id
+
+                    # Show technical ID only to internal users
+                    display_name = f"{friendly_name} (`{task_id}`)" if is_internal else friendly_name
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
-                        message=ChatMessage(role="assistant", content=f"Completed `{task_id}`\n"),
+                        message=ChatMessage(role="assistant", content=f"Completed **{display_name}**\n"),
                         done=False
                     ).model_dump_json() + "\n"
                     last_success_task = task_id
@@ -328,11 +389,24 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             xcom_resp = requests.get(xcom_url, headers=AIRFLOW_HEADERS)
             if xcom_resp.status_code == 200:
                 raw = xcom_resp.json().get("value")
-                data = ast.literal_eval(raw) if isinstance(raw, str) else raw
+                # Robust Parsing
+                data = None
+                logging.info(f"Raw XCom data: {raw}")
+                if isinstance(raw, (dict, list)):
+                    data = raw
+                elif isinstance(raw, str):
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        try:
+                            data = ast.literal_eval(raw)
+                        except (ValueError, SyntaxError):
+                            data = {"message": raw, "status": "unknown"}
+                
+                logger.info(f"Parsed XCom Data: {data} (Type: {type(data)})")
                 
                 if isinstance(data, dict) and data.get("status") == "success":
                     
-                    # --- NEW LOGIC: JUST PRINT THE DAG'S OUTPUT ---
                     if "markdown_output" in data:
                         final_content = data["markdown_output"]
                     
@@ -346,7 +420,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                             f'<video width="100%" controls>\n'
                             f'  <source src="{video_url}" type="video/mp4">\n'
                             f'  Your browser does not support the video tag.\n'
-                            f'</video>\n'
+                            f'</video>\n\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
                     
@@ -461,6 +535,16 @@ async def chat_dag(request: Request):
         user_name = headers.get('x-openwebui-user-name', 'Anonymous User')
         request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4())[:8])
         
+        chat_id = headers.get('x-openwebui-chat-id', request_id)
+        logging.info(f"Chat ID: {chat_id}")
+        
+        chat_shared_path = Path(SHARED_STORAGE_PATH) / chat_id
+        chat_cache_path = Path(CACHE_ROOT) / chat_id
+        chat_logs_path = Path(LOGS_ROOT) / chat_id
+        
+        for p in [chat_shared_path, chat_cache_path, chat_logs_path]:
+            p.mkdir(parents=True, exist_ok=True)
+        
         logger.info(f"Chat request from user: {user_email} (ID: {user_id})")
         
         messages = body.get("messages", [])
@@ -500,7 +584,7 @@ async def chat_dag(request: Request):
             for idx, base64_image in enumerate(images, 1):
                 try:
                     image_bytes, metadata = verify_and_decode_image(base64_image)
-                    save_info = save_image(image_bytes, request_id, metadata)
+                    save_info = save_image(image_bytes, chat_shared_path, metadata)
                     saved_images.append(save_info)
                     # Capture the absolute path for the DAG
                     saved_paths.append(save_info['path'])
@@ -538,13 +622,13 @@ async def chat_dag(request: Request):
             # TRIGGER DAG FLOW
             # We ignore the initial summary text for the stream and let the generator handle the response
             return StreamingResponse(
-                generate_stream_response(model, saved_paths, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys),
+                generate_stream_response(model, saved_paths, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys, chat_id),
                 media_type="application/x-ndjson"
             )
         elif stream and not saved_paths:
              # Fallback for text-only streaming
              return StreamingResponse(
-                generate_stream_response(model, "", user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys), # Handle empty path case in generator if needed
+                generate_stream_response(model, "", user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys, chat_id), # Handle empty path case in generator if needed
                 media_type="application/x-ndjson"
             )
         else:
