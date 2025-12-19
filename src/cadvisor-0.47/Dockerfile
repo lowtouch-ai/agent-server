@@ -1,14 +1,9 @@
-FROM gcr.io/cadvisor/cadvisor:v0.47.2
+FROM ghcr.io/google/cadvisor:latest
 USER root
 RUN apk add --no-cache bash
 RUN apk update \
-        && apk add --no-cache curl zip jq python3 python3-dev apk-cron \
-	&& wget https://bootstrap.pypa.io/pip/3.6/get-pip.py \
-        && python3 get-pip.py \
-	&& pip3 install -U setuptools 
-RUN pip3 install supervisor \
-	&& mkdir -p /appz/log/supervisor
-
+    && apk add --no-cache curl zip jq python3 python3-dev apk-cron supervisor logrotate \
+    && mkdir -p /appz/log/supervisor
 VOLUME /appz/log
 VOLUME /appz/home
 VOLUME /appz/cache
@@ -18,7 +13,7 @@ VOLUME /appz/keys
 
 RUN mkdir -p  /var/lib/logrotate/
 
-RUN apk add logrotate 
+RUN apk add logrotate
 ADD scripts /appz/scripts
 ADD conf/logrotate.conf /etc/logrotate.d/
 RUN chmod 644 /etc/logrotate.d/logrotate.conf
@@ -29,9 +24,9 @@ ADD supervisor/cron.conf /etc/supervisor/conf.d/cron.conf
 ADD supervisor/logrotate.conf /etc/supervisor/conf.d/logrotate.conf
 ADD supervisor/* /etc/supervisor/conf.d/
 RUN chmod +x /appz/scripts/*.sh \
-        && crontab -r | { cat; echo "* */3 * * * /bin/bash -c  /appz/scripts/logrotate.sh"; } | crontab - \ 
+        && crontab -r | { cat; echo "* */3 * * * /bin/bash -c  /appz/scripts/logrotate.sh"; } | crontab - \
         && crontab -l | { cat; echo "@reboot  mkdir -p /appz/log/archive "; } | crontab - \
-	&& crontab -l | { cat;  echo "*/15 * * * * /bin/bash -c  /appz/scripts/cleanup.sh"; } | crontab -
+        && crontab -l | { cat;  echo "*/15 * * * * /bin/bash -c  /appz/scripts/cleanup.sh"; } | crontab -
 
 RUN echo 'alias ctl="supervisorctl"' >> /appz/.bashrc \
         && echo 'alias status="supervisorctl status"' >> /appz/.bashrc \

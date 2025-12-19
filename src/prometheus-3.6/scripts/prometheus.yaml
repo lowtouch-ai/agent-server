@@ -49,3 +49,27 @@ scrape_configs:
     static_configs:
     - targets: ['graylog:9833']
 
+  - job_name: 'node_exporter'
+    static_configs:
+    - targets: ['nodeexporter:9100']
+
+  - job_name: 'blackbox_exporter'
+    static_configs:
+    - targets: ['blackboxexporter:9115']
+
+  - job_name: 'clipfoundry/cadvisor'
+    static_configs:
+    - targets: ['10.142.0.17:8888']
+    metric_relabel_configs:
+      # Extract container name from docker ID
+    - source_labels: [id]
+        regex: '/system.slice/docker-([0-9a-f]+).scope'
+          target_label: container_id
+       replacement: '$1'
+         # Add container name by matching ID to docker ps
+    - source_labels: [id]
+        regex: '^/system.slice/docker-.*'
+        target_label: container
+        replacement: 'docker'
+
+
