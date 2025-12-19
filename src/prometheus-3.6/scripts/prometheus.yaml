@@ -49,3 +49,15 @@ scrape_configs:
     static_configs:
     - targets: ['graylog:9833']
 
+  - job_name: 'node_exporter'
+    static_configs:
+    - targets: ['nodeexporter:9100']
+
+  - job_name: 'blackbox_exporter'
+    static_configs:
+    - targets: ['blackboxexporter:9115']
+
+  - job_name: 'clipfoundry/cadvisor'
+    static_configs:
+    - targets: ['10.142.0.17:8888']
+
