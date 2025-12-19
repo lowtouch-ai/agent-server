@@ -4,72 +4,85 @@ global:
   scrape_timeout: 10s
 
 rule_files:
-- /etc/prometheus/rules.yaml
+  - /etc/prometheus/rules.yaml
 
 scrape_configs:
-
-  - job_name: 'prometheus'
+  - job_name: prometheus
     static_configs:
-    - targets: ['localhost:9090']
+      - targets:
+          - localhost:9090
 
-  - job_name: 'redis'
+  - job_name: redis
     static_configs:
-    - targets: ['redis:9121']
+      - targets:
+          - redis:9121
 
-  - job_name: 'postgres_15'
+  - job_name: postgres_15
     static_configs:
-    - targets: ['postgres_master:9187']
+      - targets:
+          - postgres_master:9187
 
-  - job_name: 'postgres_13'
+  - job_name: postgres_13
     static_configs:
-    - targets: ['postgres_master:9187']
+      - targets:
+          - postgres_master:9187
 
-  - job_name: 'mariadb'
+  - job_name: mariadb
     static_configs:
-    - targets: ['mariadb:9104']
+      - targets:
+          - mariadb:9104
 
-  - job_name: 'mongo'
+  - job_name: mongo
     static_configs:
-    - targets: ['mongo:9216']
+      - targets:
+          - mongo:9216
 
-  - job_name: 'httpd'
+  - job_name: httpd
     static_configs:
-    - targets: ['httpd:9117']
+      - targets:
+          - httpd:9117
 
-  - job_name: 'airflow'
+  - job_name: airflow
     static_configs:
-    - targets: ['airflow:9102']
+      - targets:
+          - airflow:9102
 
-  - job_name: 'opensearch'
-    metrics_path: '/_prometheus/metrics'
+  - job_name: opensearch
+    metrics_path: /_prometheus/metrics
     static_configs:
-    - targets: ['opensearch:9200']
+      - targets:
+          - opensearch:9200
 
-  - job_name: 'graylog'
+  - job_name: graylog
     static_configs:
-    - targets: ['graylog:9833']
+      - targets:
+          - graylog:9833
 
-  - job_name: 'node_exporter'
+  - job_name: node_exporter
     static_configs:
-    - targets: ['nodeexporter:9100']
+      - targets:
+          - 10.142.0.17:9100
 
-  - job_name: 'blackbox_exporter'
+  - job_name: blackbox_exporter
     static_configs:
-    - targets: ['blackboxexporter:9115']
+      - targets:
+          - blackboxexporter:9115
 
-  - job_name: 'clipfoundry/cadvisor'
+  - job_name: cadvisor
     static_configs:
-    - targets: ['10.142.0.17:8888']
+      - targets:
+          - 10.142.0.17:8888
+
     metric_relabel_configs:
-      # Extract container name from docker ID
-    - source_labels: [id]
+      # Extract container ID from docker cgroup path
+      - source_labels: [id]
         regex: '/system.slice/docker-([0-9a-f]+).scope'
-          target_label: container_id
-       replacement: '$1'
-         # Add container name by matching ID to docker ps
-    - source_labels: [id]
+        target_label: container_id
+        replacement: '$1'
+
+      # Label docker containers
+      - source_labels: [id]
         regex: '^/system.slice/docker-.*'
         target_label: container
         replacement: 'docker'
-
 
