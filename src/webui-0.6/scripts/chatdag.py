@@ -226,7 +226,7 @@ def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str) ->
     try:
         res = requests.get(url, headers=AIRFLOW_HEADERS, timeout=5)
         if res.status_code == 200:
-            return res.text.split('\n')
+            return res.content.decode('utf-8', errors='replace').split('\n')
     except Exception as e:
         logger.error(f"Failed to fetch logs: {e}")
     return []
