@@ -19,7 +19,7 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
-  "id": 4,
+  "id": 10,
   "links": [
     {
       "icon": "bolt",
@@ -2292,6 +2292,7 @@
           ],
           "show": false
         },
+        "frameIndex": 0,
         "showHeader": true
       },
       "pluginVersion": "12.0.2",
@@ -2668,11 +2669,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "increase(node_network_receive_bytes_total{instance=~\"$node\",device=~\"$device\"}[60m])",
+          "editorMode": "code",
+          "expr": "sum by (device) (\r\n  rate(node_network_receive_bytes_total{device=\"eth0\"}[5m])\r\n) * 3600",
           "interval": "60m",
           "intervalFactor": 1,
           "legendFormat": "{{device}}_receive",
           "metric": "",
+          "range": true,
           "refId": "A",
           "step": 600,
           "target": ""
@@ -2682,11 +2685,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "increase(node_network_transmit_bytes_total{instance=~\"$node\",device=~\"$device\"}[60m])",
+          "editorMode": "code",
+          "expr": "sum by (device) (\r\n  rate(node_network_transmit_bytes_total{device=\"eth0\"}[5m])\r\n) * 3600",
           "hide": false,
           "interval": "60m",
           "intervalFactor": 1,
           "legendFormat": "{{device}}_transmit",
+          "range": true,
           "refId": "B",
           "step": 600
         }
@@ -3208,11 +3213,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "rate(node_network_receive_bytes_total{instance=~'$node',device=~\"$device\"}[$interval])*8",
+          "editorMode": "code",
+          "expr": "rate(node_network_receive_bytes_total{instance=\"10.142.0.17:9100\", device=\"eth0\"}[$__rate_interval]) * 8",
           "format": "time_series",
           "interval": "",
           "intervalFactor": 1,
           "legendFormat": "{{device}}_receive",
+          "range": true,
           "refId": "A",
           "step": 4
         },
@@ -3221,11 +3228,13 @@
             "type": "prometheus",
             "uid": "PBFA97CFB590B2093"
           },
-          "expr": "rate(node_network_transmit_bytes_total{instance=~'$node',device=~\"$device\"}[$interval])*8",
+          "editorMode": "code",
+          "expr": "rate(node_network_transmit_bytes_total{instance=\"10.142.0.17:9100\", device=\"eth0\"}[$__rate_interval]) * 8",
           "format": "time_series",
           "interval": "",
           "intervalFactor": 1,
           "legendFormat": "{{device}}_transmit",
+          "range": true,
           "refId": "B",
           "step": 4
         }
@@ -6408,8 +6417,8 @@
       },
       {
         "current": {
-          "text": "nvdevkit2025a/node_exporter",
-          "value": "nvdevkit2025a/node_exporter"
+          "text": "node_exporter",
+          "value": "node_exporter"
         },
         "datasource": {
           "type": "prometheus",
@@ -6449,10 +6458,10 @@
       {
         "current": {
           "text": [
-            "nodeexporter:9100"
+            "10.142.0.17:9100"
           ],
           "value": [
-            "nodeexporter:9100"
+            "10.142.0.17:9100"
           ]
         },
         "datasource": {
@@ -6547,8 +6556,8 @@
       },
       {
         "current": {
-          "text": "/var/lib/docker",
-          "value": "/var/lib/docker"
+          "text": "/",
+          "value": "/"
         },
         "datasource": {
           "type": "prometheus",
@@ -6568,8 +6577,8 @@
       },
       {
         "current": {
-          "text": "nvdevkit2025a",
-          "value": "nvdevkit2025a"
+          "text": "walpole.clipfoundry.ai",
+          "value": "walpole.clipfoundry.ai"
         },
         "datasource": {
           "type": "prometheus",
@@ -6626,5 +6635,5 @@
   "timezone": "browser",
   "title": "AppZ Nodes - v5",
   "uid": "xfpJB9FGz",
-  "version": 1
+  "version": 2
 }
