@@ -220,9 +220,9 @@ def map_log_to_friendly_status(line: str, is_internal: bool = False) -> Optional
         return line
     return None
 
-def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str) -> list:
+def get_airflow_logs(run_id: str, try_number: int, dag_id: str, task_id: str, map_index: int = -1) -> list:
     """Fetches and cleans logs for the specific task run."""
-    url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}"
+    url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{run_id}/taskInstances/{task_id}/logs/{try_number}?map_index={map_index}"
     try:
         res = requests.get(url, headers=AIRFLOW_HEADERS, timeout=5)
         if res.status_code == 200:
@@ -255,7 +255,7 @@ async def get_task_docs(dag_id: str) -> Dict[str, str]:
         logger.warning(f"Could not fetch task docs: {e}")
     return {}
 
-async def generate_stream_response(model: str, image_paths: List[str], original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str, chat_id: Dict[str, Any]) -> AsyncGenerator[str, None]:
+async def generate_stream_response(model: str, image_paths: List[str], original_prompt: str, dag_id: str, headers: Dict[str, str], messages: List[Dict[str, Any]], user_email: str, user_id: str, user_name: str, user_role: str, vault_user: str, vault_keys: str, chat_id: str) -> AsyncGenerator[str, None]:
     """Streaming response with Airflow logs inside a <think> block."""
     
     request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4()))
@@ -280,15 +280,33 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             "X-LTAI-User-Name": user_name,
             "X-LTAI-Vault-User": vault_user,
             "X-LTAI-Vault-Keys": vault_keys,
-            "X-LTAI-Request-ID": request_id
+            "X-LTAI-Request-ID": request_id,
+            "X-LTAI-Chat-ID": chat_id
         }
         # Construct chat_inputs (adapt to existing structure)
         last_message = messages[-1] if messages else {}
         # Map all paths to the file object structure
         files_list = [{"path": p, "type": "image"} for p in image_paths]
+        raw_history = messages[:-1] if len(messages) > 1 else []
+        filtered_history = []
+
+        for msg in raw_history:
+            content = msg.get("content", "")
+            # Check if this is a previous Assistant response containing the generated video/HTML
+            if msg.get("role") == "assistant" and ("### 🎬 Video Ready!" in content or "<video" in content):
+                sanitized_msg = msg.copy()
+                sanitized_msg["content"] = "✅ [Video successfully generated and delivered to user]"
+                # Remove images from assistant reply if any exist to save tokens
+                if "images" in sanitized_msg:
+                    sanitized_msg["images"] = [] 
+                filtered_history.append(sanitized_msg)
+            else:
+                # Keep User messages (with their images/prompts) and text-only Assistant replies intact
+                filtered_history.append(msg)
+
         chat_inputs = {
             "message": last_message.get("content", ""),
-            "history": messages[:-1] if len(messages) > 1 else [],
+            "history": filtered_history,
             "files": files_list,
             "args": {"image_path": image_paths[0]} if image_paths else {},  # Preserve for DAG compatibility
             "timestamp": datetime.utcnow().isoformat(),
@@ -306,15 +324,21 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
         resp.raise_for_status()
         dag_run_id = resp.json()['dag_run_id']
 
-        # Get all task instances
+        # Get initial task instances
         ti_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances"
         ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
         task_instances = ti_resp.json().get("task_instances", []) if ti_resp.status_code == 200 else []
 
-        # Track log progress per task
-        last_log_counts = {ti["task_id"]: 0 for ti in task_instances}
+        # Helper: Robust Key Generation
+        def get_ti_key(ti):
+            raw_idx = ti.get('map_index')
+            idx = -1 if raw_idx is None else raw_idx
+            return f"{ti['task_id']}_{idx}"
+
+        last_log_counts = {}
         started_tasks = set()     # Tracks 'Started {task}'
         completed_tasks = set()   # Tracks 'Completed {task}'
+        last_success_task = None
 
         status = "running"
         while status in ["queued", "running"]:
@@ -325,62 +349,111 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             if run_resp.status_code == 200:
                 status = run_resp.json().get("state", "running")
 
+            # Refresh task list
+            ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
+            if ti_resp.status_code != 200:
+                continue
+                
+            task_instances = ti_resp.json().get("task_instances", [])
+
+            # Tasks are processed in chronological order of their start time
+            task_instances.sort(key=lambda x: x.get('start_date') or "9999-12-31")
+
             # Poll each task
             for ti in task_instances:
                 task_id = ti["task_id"]
-                task_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}"
-                task_resp = requests.get(task_url, headers=AIRFLOW_HEADERS)
-                if task_resp.status_code != 200:
+                current_state = ti.get("state")
+                
+                # If the task is skipped, ignore it completely (no start, no logs, no complete)
+                if current_state == "skipped":
                     continue
-                task_info = task_resp.json()
-                current_state = task_info.get("state")
-                try_num = task_info.get("try_number", 1)
+                
+                # Normalize map_index
+                raw_idx = ti.get('map_index')
+                map_index = -1 if raw_idx is None else raw_idx
+                
+                unique_key = get_ti_key(ti)
+                try_num = ti.get("try_number", 1)
 
-                # Emit "started" only once
-                # We check if task is running/queued/success and hasn't been announced yet
-                is_active = current_state in ["running", "queued", "success", "failed", "upstream_failed"]
-                if is_active and task_id not in started_tasks:
+                # Initialize log count if new task found
+                if unique_key not in last_log_counts:
+                    last_log_counts[unique_key] = 0
+
+                # 1. Emit "Started"
+                is_active = current_state in ["running", "queued", "upstream_failed"]
+                is_done = current_state in ["success", "failed"]
+                if (is_active or is_done) and unique_key not in started_tasks:
                     friendly_name = task_docs.get(task_id) or task_id
                     
                     # Show technical ID only to internal users
                     display_name = f"{friendly_name} (`{task_id}`)" if is_internal else friendly_name
+                    # Add map index to display if it's a parallel task
+                    if map_index >= 0:
+                        display_name += f" #{map_index + 1}"
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
                         message=ChatMessage(role="assistant", content=f"**{display_name}**...\n"),
                         done=False
                     ).model_dump_json() + "\n"
-                    started_tasks.add(task_id)
+                    started_tasks.add(unique_key)
 
-                # Stream new logs
-                logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id)
-                new_logs = logs[last_log_counts[task_id]:]
-                last_log_counts[task_id] = len(logs)
+                # 2. Stream Logs
+                # Only fetch logs if the task is active or finished
+                if unique_key in started_tasks:
+                    if current_state not in ["queued", "scheduled", "None"]:
+                        logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id, map_index=map_index)
+                        current_count = last_log_counts.get(unique_key, 0)
+                        new_logs = logs[current_count:]
+                        last_log_counts[unique_key] = len(logs)
 
-                for line in new_logs:
-                    clean = map_log_to_friendly_status(line, is_internal=is_internal)
-                    if clean:
-                        yield StreamChunk(
-                            model=model,
-                            created_at=datetime.now().isoformat(),
-                            message=ChatMessage(role="assistant", content=f"{clean}\n"),
-                            done=False
-                        ).model_dump_json() + "\n"
+                        for line in new_logs:
+                            clean = map_log_to_friendly_status(line, is_internal=is_internal)
+                            if clean:
+                                yield StreamChunk(
+                                    model=model,
+                                    created_at=datetime.now().isoformat(),
+                                    message=ChatMessage(role="assistant", content=f"{clean}\n"),
+                                    done=False
+                                ).model_dump_json() + "\n"
 
-                # 2. Emit "Completed" ONCE when task succeeds/fails
-                if current_state in ["success", "failed", "skipped"] and task_id not in completed_tasks:
+                # 3. Emit "Completed"
+                if is_done and unique_key not in completed_tasks:
                     friendly_name = task_docs.get(task_id) or task_id
 
                     # Show technical ID only to internal users
                     display_name = f"{friendly_name} (`{task_id}`)" if is_internal else friendly_name
+                    if map_index >= 0:
+                        display_name += f" #{map_index + 1}"
                     yield StreamChunk(
                         model=model,
                         created_at=datetime.now().isoformat(),
                         message=ChatMessage(role="assistant", content=f"Completed **{display_name}**\n"),
                         done=False
                     ).model_dump_json() + "\n"
-                    last_success_task = task_id
-                    completed_tasks.add(task_id)
+                    completed_tasks.add(unique_key)
+                    if current_state == "success":
+                        last_success_task = task_id
+        
+            # Refresh task list for next iteration
+            ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
+            if ti_resp.status_code == 200:
+                task_instances = ti_resp.json().get("task_instances", [])
+
+        # Final Poll to ensure we catch the very last task state if loop exited fast
+        ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
+        if ti_resp.status_code == 200:
+            task_instances = ti_resp.json().get("task_instances", [])
+            # Sort by end_date to find the true last successful task
+            successful_tasks = [
+                ti for ti in task_instances 
+                if ti.get('state') == 'success' and ti.get('end_date')
+            ]
+            if successful_tasks:
+                # Sort by end_date descending to get the absolute last one
+                successful_tasks.sort(key=lambda x: x['end_date'], reverse=True)
+                last_success_task = successful_tasks[0]['task_id']
+                logger.info(f"Final poll identified last successful task: {last_success_task}")
 
         # Final XCom from last successful task
         final_content = "DAG completed but no result found."
@@ -389,9 +462,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             xcom_resp = requests.get(xcom_url, headers=AIRFLOW_HEADERS)
             if xcom_resp.status_code == 200:
                 raw = xcom_resp.json().get("value")
-                # Robust Parsing
                 data = None
-                logging.info(f"Raw XCom data: {raw}")
                 if isinstance(raw, (dict, list)):
                     data = raw
                 elif isinstance(raw, str):
@@ -402,8 +473,6 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                             data = ast.literal_eval(raw)
                         except (ValueError, SyntaxError):
                             data = {"message": raw, "status": "unknown"}
-                
-                logger.info(f"Parsed XCom Data: {data} (Type: {type(data)})")
                 
                 if isinstance(data, dict) and data.get("status") == "success":
                     
@@ -571,6 +640,15 @@ async def chat_dag(request: Request):
         last_message = messages[-1]
         user_content = last_message.get("content", "").strip()
         images = last_message.get("images", [])
+
+        if not images:
+            logger.info("No images in current message, checking conversation history...")
+            # Iterate backwards through previous messages
+            for msg in reversed(messages[:-1]):
+                if msg.get("images") and isinstance(msg["images"], list) and len(msg["images"]) > 0:
+                    images = msg["images"]
+                    logger.info(f"✅ Found {len(images)} images in previous conversation context.")
+                    break
         
         logger.info(f"Processing message with {len(images)} image(s), stream={stream}")
         
