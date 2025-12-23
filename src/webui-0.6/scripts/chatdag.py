@@ -8,6 +8,7 @@ from typing import Optional, List, AsyncGenerator, Dict, Any
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
@@ -61,6 +62,8 @@ logger.info(f"Video output path: {VIDEO_OUTPUT_DIR}")
 logger.info(f"Cache path: {CACHE_ROOT}")
 logger.info(f"Logs path: {LOGS_ROOT}")
 
+if os.path.exists(VIDEO_OUTPUT_DIR):
+    app.mount("/static/videos", StaticFiles(directory=VIDEO_OUTPUT_DIR), name="video_static")
 
 class ChatMessage(BaseModel):
     role: str
@@ -447,7 +450,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             # Sort by end_date to find the true last successful task
             successful_tasks = [
                 ti for ti in task_instances 
-                if ti.get('state') == 'success' and ti.get('end_date')
+                if ti.get('state') == 'success' and ti.get('end_date') and ti['task_id'] != 'end'
             ]
             if successful_tasks:
                 # Sort by end_date descending to get the absolute last one
