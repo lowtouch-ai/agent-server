@@ -324,18 +324,18 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
         resp.raise_for_status()
         dag_run_id = resp.json()['dag_run_id']
 
-        # Get all task instances
+        # Get initial task instances
         ti_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances"
         ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
         task_instances = ti_resp.json().get("task_instances", []) if ti_resp.status_code == 200 else []
 
+        # Helper: Robust Key Generation
         def get_ti_key(ti):
             raw_idx = ti.get('map_index')
             idx = -1 if raw_idx is None else raw_idx
             return f"{ti['task_id']}_{idx}"
 
-        # Track log progress per task
-        last_log_counts = {get_ti_key(ti): 0 for ti in task_instances}
+        last_log_counts = {}
         started_tasks = set()     # Tracks 'Started {task}'
         completed_tasks = set()   # Tracks 'Completed {task}'
         last_success_task = None
@@ -349,22 +349,40 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             if run_resp.status_code == 200:
                 status = run_resp.json().get("state", "running")
 
+            # Refresh task list
+            ti_resp = requests.get(ti_url, headers=AIRFLOW_HEADERS)
+            if ti_resp.status_code != 200:
+                continue
+                
+            task_instances = ti_resp.json().get("task_instances", [])
+
+            # Tasks are processed in chronological order of their start time
+            task_instances.sort(key=lambda x: x.get('start_date') or "9999-12-31")
+
             # Poll each task
             for ti in task_instances:
                 task_id = ti["task_id"]
+                current_state = ti.get("state")
+                
+                # If the task is skipped, ignore it completely (no start, no logs, no complete)
+                if current_state == "skipped":
+                    continue
+                
                 # Normalize map_index
                 raw_idx = ti.get('map_index')
                 map_index = -1 if raw_idx is None else raw_idx
                 
                 unique_key = get_ti_key(ti)
-
-                current_state = ti.get("state")
                 try_num = ti.get("try_number", 1)
 
-                # Emit "started" only once
-                # We check if task is running/queued/success and hasn't been announced yet
-                is_active = current_state in ["running", "queued", "success", "failed", "upstream_failed"]
-                if is_active and unique_key not in started_tasks:
+                # Initialize log count if new task found
+                if unique_key not in last_log_counts:
+                    last_log_counts[unique_key] = 0
+
+                # 1. Emit "Started"
+                is_active = current_state in ["running", "queued", "upstream_failed"]
+                is_done = current_state in ["success", "failed"]
+                if (is_active or is_done) and unique_key not in started_tasks:
                     friendly_name = task_docs.get(task_id) or task_id
                     
                     # Show technical ID only to internal users
@@ -382,25 +400,25 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
 
                 # 2. Stream Logs
                 # Only fetch logs if the task is active or finished
-                if is_active or current_state in ["success", "failed"]:
-                    logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id, map_index=map_index)
-                    
-                    current_count = last_log_counts.get(unique_key, 0)
-                    new_logs = logs[current_count:]
-                    last_log_counts[unique_key] = len(logs)
+                if unique_key in started_tasks:
+                    if current_state not in ["queued", "scheduled", "None"]:
+                        logs = get_airflow_logs(dag_run_id, try_num, dag_id, task_id, map_index=map_index)
+                        current_count = last_log_counts.get(unique_key, 0)
+                        new_logs = logs[current_count:]
+                        last_log_counts[unique_key] = len(logs)
 
-                    for line in new_logs:
-                        clean = map_log_to_friendly_status(line, is_internal=is_internal)
-                        if clean:
-                            yield StreamChunk(
-                                model=model,
-                                created_at=datetime.now().isoformat(),
-                                message=ChatMessage(role="assistant", content=f"{clean}\n"),
-                                done=False
-                            ).model_dump_json() + "\n"
+                        for line in new_logs:
+                            clean = map_log_to_friendly_status(line, is_internal=is_internal)
+                            if clean:
+                                yield StreamChunk(
+                                    model=model,
+                                    created_at=datetime.now().isoformat(),
+                                    message=ChatMessage(role="assistant", content=f"{clean}\n"),
+                                    done=False
+                                ).model_dump_json() + "\n"
 
                 # 3. Emit "Completed"
-                if current_state in ["success", "failed", "skipped"] and unique_key not in completed_tasks:
+                if is_done and unique_key not in completed_tasks:
                     friendly_name = task_docs.get(task_id) or task_id
 
                     # Show technical ID only to internal users
@@ -445,7 +463,6 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
             if xcom_resp.status_code == 200:
                 raw = xcom_resp.json().get("value")
                 data = None
-                logging.info(f"Raw XCom data: {raw}")
                 if isinstance(raw, (dict, list)):
                     data = raw
                 elif isinstance(raw, str):
