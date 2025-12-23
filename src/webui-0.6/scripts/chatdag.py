@@ -489,10 +489,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                         final_content = (
                             f"### 🎬 Video Ready!\n\n"
                             f"Your video has been generated successfully.\n\n"
-                            f'<video width="100%" controls>\n'
-                            f'  <source src="{video_url}" type="video/mp4">\n'
-                            f'  Your browser does not support the video tag.\n'
-                            f'</video>\n\n'
+                            f'<video width="100%" controls src="{video_url}"></video>\n\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
                     
