@@ -458,7 +458,8 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                 last_success_task = successful_tasks[0]['task_id']
                 logger.info(f"Final poll identified last successful task: {last_success_task}")
 
-        # Final XCom from last successful task
+        # Final XCom Retrieval
+        is_rich_media = False
         final_content = "DAG completed but no result found."
         if last_success_task:
             xcom_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{last_success_task}/xcomEntries/return_value"
@@ -489,11 +490,10 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                         final_content = (
                             f"### 🎬 Video Ready!\n\n"
                             f"Your video has been generated successfully.\n\n"
-                            f'<video width="100%" controls src="{video_url}"></video>\n\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
                     
-                    # Fallback for Image Saver
+                        is_rich_media = True
                     elif "file_size" in data:
                         final_content = f"**Image Saved**\nFile: `{os.path.basename(data.get('image_path', ''))}`\nSize: {data.get('file_size')} bytes"
                         
@@ -516,19 +516,37 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
         done=False
     ).model_dump_json() + "\n"
 
-    # 4. Stream the Final Response (Preserving Markdown Formatting)
-    # We chunk by characters instead of splitting by words to preserve newlines (\n)
-    
-    chunk_size = 50  # Send 50 characters at a time
-    for i in range(0, len(final_content), chunk_size):
-        chunk = final_content[i:i+chunk_size]
+    # Stream the Final Response
+    if is_rich_media:
+        # IMPORTANT: Send rich HTML in one atomic message
         yield StreamChunk(
             model=model,
             created_at=datetime.now().isoformat(),
-            message=ChatMessage(role="assistant", content=chunk),
+            message=ChatMessage(
+                role="assistant",
+                content=final_content,
+                files=[
+                    {
+                        "type": "video",
+                        "url": video_url,
+                        "name": os.path.basename(video_url)
+                    }
+                ]
+            ),
             done=False
         ).model_dump_json() + "\n"
-        await asyncio.sleep(0.01)
+    else:
+        # Safe to stream text / markdown
+        chunk_size = 50
+        for i in range(0, len(final_content), chunk_size):
+            chunk = final_content[i:i+chunk_size]
+            yield StreamChunk(
+                model=model,
+                created_at=datetime.now().isoformat(),
+                message=ChatMessage(role="assistant", content=chunk),
+                done=False
+            ).model_dump_json() + "\n"
+            await asyncio.sleep(0.01)
     
     # --- Final done chunk ---
     final = FinalResponse(
