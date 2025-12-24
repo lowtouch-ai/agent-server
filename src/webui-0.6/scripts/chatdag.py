@@ -8,6 +8,7 @@ from typing import Optional, List, AsyncGenerator, Dict, Any
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
@@ -91,6 +92,8 @@ logger.info(f"Video output path: {VIDEO_OUTPUT_DIR}")
 logger.info(f"Cache path: {CACHE_ROOT}")
 logger.info(f"Logs path: {LOGS_ROOT}")
 
+if os.path.exists(VIDEO_OUTPUT_DIR):
+    app.mount("/static/videos", StaticFiles(directory=VIDEO_OUTPUT_DIR), name="video_static")
 
 class ChatMessage(BaseModel):
     role: str
