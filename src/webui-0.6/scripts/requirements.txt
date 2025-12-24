@@ -4,3 +4,4 @@ pillow==10.4.0
 requests==2.32.3
 uvicorn==0.30.6
 httpx==0.28.1
+minio==7.2.20

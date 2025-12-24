@@ -8,7 +8,6 @@ from typing import Optional, List, AsyncGenerator, Dict, Any
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
@@ -52,6 +51,36 @@ LOGS_ROOT = os.getenv("LOGS_DIR")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
+from minio import Minio
+from minio.error import S3Error
+from datetime import timedelta
+
+# --- REMOVE/MODIFY CONFIGURATION ---
+# (Keep your Airflow configs, but add MinIO configs below)
+
+# MinIO Configuration
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000") # e.g., localhost:9000
+MINIO_ACCESS_KEY = os.getenv("CF_MINIO_USER", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("CF_MINIO_PASSWORD", "minioadmin")
+MINIO_BUCKET = os.getenv("CF_MINIO_BUCKET", "clipfoundry")
+# Set secure=True if using HTTPS
+MINIO_SECURE = os.getenv("MINIO_SECURE", "False").lower() == "true"
+
+# Initialize MinIO Client
+try:
+    minio_client = Minio(
+        MINIO_ENDPOINT,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=MINIO_SECURE
+    )
+    # Ensure bucket exists
+    if not minio_client.bucket_exists(MINIO_BUCKET):
+        minio_client.make_bucket(MINIO_BUCKET)
+        logger.info(f"Created MinIO bucket: {MINIO_BUCKET}")
+except Exception as e:
+    logger.error(f"MinIO Connection Error: {e}")
+
 # Ensure storage directory exists
 Path(SHARED_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -62,8 +91,6 @@ logger.info(f"Video output path: {VIDEO_OUTPUT_DIR}")
 logger.info(f"Cache path: {CACHE_ROOT}")
 logger.info(f"Logs path: {LOGS_ROOT}")
 
-if os.path.exists(VIDEO_OUTPUT_DIR):
-    app.mount("/static/videos", StaticFiles(directory=VIDEO_OUTPUT_DIR), name="video_static")
 
 class ChatMessage(BaseModel):
     role: str
@@ -96,6 +123,66 @@ class FinalResponse(BaseModel):
     prompt_eval_duration: int
     eval_count: int
     eval_duration: int
+
+def save_image_to_minio(image_bytes: bytes, chat_id: str, metadata: dict) -> dict:
+    """Uploads image to MinIO under the chat_id prefix."""
+    try:
+        format_to_ext = {
+            "JPEG": ".jpg", "PNG": ".png", "GIF": ".gif",
+            "BMP": ".bmp", "WEBP": ".webp"
+        }
+        file_ext = format_to_ext.get(metadata.get("format", "PNG"), ".png")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"img_{timestamp}_{unique_id}{file_ext}"
+        
+        # KEY CHANGE: Organize by chat_id
+        object_name = f"{chat_id}/{filename}"
+        
+        # Create stream for MinIO
+        data_stream = io.BytesIO(image_bytes)
+        size = len(image_bytes)
+        
+        minio_client.put_object(
+            bucket_name=MINIO_BUCKET,
+            object_name=object_name,
+            data=data_stream,
+            length=size,
+            content_type=f"image/{file_ext.strip('.')}"
+        )
+        
+        logger.info(f"Image uploaded to MinIO: {MINIO_BUCKET}/{object_name}")
+        
+        return {
+            "filename": filename,
+            "bucket": MINIO_BUCKET,
+            "object_name": object_name,
+            "s3_uri": f"s3://{MINIO_BUCKET}/{object_name}",
+            "size_bytes": size,
+            "saved_at": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Failed to save image to MinIO: {str(e)}")
+        raise
+
+def get_presigned_url(object_name: str, expiration=timedelta(hours=1)) -> str:
+    """Generates a temporary URL for viewing content (Images/Videos)."""
+    try:
+        # Strip s3:// prefix if present
+        if object_name.startswith(f"s3://{MINIO_BUCKET}/"):
+            object_name = object_name.replace(f"s3://{MINIO_BUCKET}/", "")
+            
+        url = minio_client.get_presigned_url(
+            "GET",
+            MINIO_BUCKET,
+            object_name,
+            expires=expiration
+        )
+        return url
+    except Exception as e:
+        logger.error(f"Failed to generate presigned URL: {str(e)}")
+        return ""
 
 def save_video_to_static_dir(source_video_path: str) -> str:
     """Save or copy the video to the static videos directory and return the relative path."""
@@ -482,14 +569,39 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                     
                     if "markdown_output" in data:
                         final_content = data["markdown_output"]
+
+                    elif "minio_key" in data: # Check for the new key name from DAG
+                        video_object_key = data["minio_key"]
+                        
+                        # Generate Presigned URL (Valid for 1 hour)
+                        video_url = get_presigned_url(video_object_key)
+                        logger.info(f"Generated presigned URL: {video_url}")
+                        
+                        # Use the URL directly. Do NOT try to copy file locally.
+                        final_content = (
+                            f"### 🎬 Video Ready!\n\n"
+                            f"Your video has been generated successfully.\n\n"
+                            f'<video width="100%" controls>\n'
+                            f'  <source src="{video_url}" type="video/mp4">\n'
+                            f'  Your browser does not support the video tag.\n'
+                            f'</video>\n\n'
+                            f"[**⬇️ Click here to Download**]({video_url})"
+                        )
                     
                     elif "video_path" in data:
+                        video_object_key = data["video_path"]
+                        video_url = get_presigned_url(video_object_key)
+                        logger.info(f"Generated presigned URL for video: {video_url}")
                         vid_path = data["video_path"]
                         video_url = save_video_to_static_dir(vid_path)
                         
                         final_content = (
                             f"### 🎬 Video Ready!\n\n"
                             f"Your video has been generated successfully.\n\n"
+                            f'<video width="100%" controls>\n'
+                            f'  <source src="{video_url}" type="video/mp4">\n'
+                            f'  Your browser does not support the video tag.\n'
+                            f'</video>\n\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
                     
@@ -680,18 +792,16 @@ async def chat_dag(request: Request):
             for idx, base64_image in enumerate(images, 1):
                 try:
                     image_bytes, metadata = verify_and_decode_image(base64_image)
-                    save_info = save_image(image_bytes, chat_shared_path, metadata)
+                    save_info = save_image_to_minio(image_bytes, chat_id, metadata)
                     saved_images.append(save_info)
                     # Capture the absolute path for the DAG
-                    saved_paths.append(save_info['path'])
+                    saved_paths.append(save_info['s3_uri'])
                     
                     response_parts.append(
-                        f"\n📸 **Image {idx} Saved Successfully:**\n"
-                        f"   • Format: {metadata['format']}\n"
-                        f"   • Dimensions: {metadata['width']}x{metadata['height']} pixels\n"
-                        f"   • Size: {metadata['size_bytes'] / 1024:.2f} KB\n"
-                        f"   • Filename: `{save_info['filename']}`\n"
-                        f"   • Path: `{save_info['relative_path']}`\n"
+                        f"\n📸 **Image {idx} Saved (MinIO):**\n"
+                        f"   • Dimensions: {metadata['width']}x{metadata['height']}\n"
+                        f"   • Bucket: `{save_info['bucket']}`\n"
+                        f"   • Path: `{save_info['object_name']}`\n"
                     )
                 except Exception as e:
                     logger.error(f"Error processing image {idx}: {str(e)}")
