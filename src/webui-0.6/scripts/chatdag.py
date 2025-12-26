@@ -668,6 +668,13 @@ async def chat_dag(request: Request):
                     logger.info(f"✅ Found {len(images)} images in previous conversation context.")
                     break
         
+        # Collect existing images from chat directory
+        existing_paths = []
+        for file_path in chat_shared_path.iterdir():
+            if file_path.suffix.lower() in ALLOWED_EXTENSIONS:
+                existing_paths.append(str(file_path))
+        logger.info(f"Found {len(existing_paths)} existing images in chat directory: {[p.name for p in chat_shared_path.iterdir() if p.suffix.lower() in ALLOWED_EXTENSIONS]}")
+        
         logger.info(f"Processing message with {len(images)} image(s), stream={stream}")
         
         response_parts = []
@@ -675,7 +682,7 @@ async def chat_dag(request: Request):
         saved_paths = []
         
         if images:
-            response_parts.append(f"👤 Hello {user_name}! I received {len(images)} image(s).\n")
+            response_parts.append(f"👤 Hello {user_name}! I received {len(images)} new image(s). There are already {len(existing_paths)} images in this chat.\n")
             
             for idx, base64_image in enumerate(images, 1):
                 try:
@@ -700,31 +707,29 @@ async def chat_dag(request: Request):
             total_size = sum(img['size_bytes'] for img in saved_images)
             response_parts.append(
                 f"\n✅ **Summary:**\n"
-                f"   • Images saved: {len(saved_images)}/{len(images)}\n"
-                f"   • Total size: {total_size / 1024:.2f} KB\n"
-                f"   • Storage: `{SHARED_STORAGE_PATH}/{request_id}/`\n"
+                f"   • New images saved: {len(saved_images)}/{len(images)}\n"
+                f"   • Total size (new): {total_size / 1024:.2f} KB\n"
+                f"   • Storage: `{SHARED_STORAGE_PATH}/{chat_id}/`\n"
             )
         else:
             response_parts.append(
                 f"👋 Hello {user_name}!\n\n"
                 f"I'm the **Image Saver Assistant**. Send me images and I'll save them to shared storage.\n\n"
                 f"📝 Your message: {user_content or 'No text, waiting for images...'}\n\n"
-                f"💡 **How to use:** Attach images and send!"
+                f"💡 **How to use:** Attach images and send!\n\n"
+                f"📂 **Existing images in chat:** {len(existing_paths)} available."
             )
+        
+        # Append existing paths to saved_paths (now all_image_paths)
+        all_image_paths = existing_paths + saved_paths
+        response_parts.append(f"\n🔗 **Total images available for processing:** {len(all_image_paths)}")
         
         response_content = "".join(response_parts)
         
-        if stream and saved_paths:
-            # TRIGGER DAG FLOW
-            # We ignore the initial summary text for the stream and let the generator handle the response
+        if stream:
+            # Always trigger with all_image_paths (including existing + new)
             return StreamingResponse(
-                generate_stream_response(model, saved_paths, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys, chat_id),
-                media_type="application/x-ndjson"
-            )
-        elif stream and not saved_paths:
-             # Fallback for text-only streaming
-             return StreamingResponse(
-                generate_stream_response(model, "", user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys, chat_id), # Handle empty path case in generator if needed
+                generate_stream_response(model, all_image_paths, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys, chat_id),
                 media_type="application/x-ndjson"
             )
         else:
