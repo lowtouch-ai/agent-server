@@ -188,30 +188,66 @@ def get_presigned_url(object_name: str, expiration=timedelta(hours=1)) -> str:
         return ""
 
 def save_video_to_static_dir(source_video_path: str) -> str:
-    """Save or copy the video to the static videos directory and return the relative path."""
+    """
+    Save the video to the static videos directory.
+    - If input is a local path, it copies the file.
+    - If input is a MinIO/S3 path, it downloads the file.
+    Returns the relative path for the UI.
+    """
     try:
+        # 1. Generate Target Filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        
+        # Deduce extension or default to .mp4
+        ext = os.path.splitext(source_video_path)[1]
+        if not ext or len(ext) > 5: # Safety check on extension length
+            ext = ".mp4"
+            
+        filename = f"video_{timestamp}_{unique_id}{ext}"
+        target_path = Path(VIDEO_OUTPUT_DIR) / filename
+        relative_path = f"/static/videos/{filename}"
+
+        # 2. Check if it is an S3 URI (Explicit MinIO)
+        if source_video_path.startswith("s3://"):
+            logger.info(f"Detected S3 URI: {source_video_path}")
+            
+            # Remove s3:// prefix
+            clean_path = source_video_path.replace("s3://", "")
+            
+            # Parse Bucket and Object Name
+            if "/" in clean_path:
+                bucket, object_name = clean_path.split("/", 1)
+            else:
+                # Edge case: if path is just the bucket? unlikely for a video file
+                raise ValueError(f"Invalid S3 path format: {source_video_path}")
+            
+            logger.info(f"Downloading from MinIO [Bucket: {bucket}, Key: {object_name}] -> {target_path}")
+            minio_client.fget_object(bucket, object_name, str(target_path))
+            return relative_path
         source = Path(source_video_path)
         
         if not source.exists():
             clean_rel = str(source).lstrip("/") 
             source = Path(SHARED_STORAGE_PATH) / clean_rel
-            
-        if not source.exists():
-            logger.error(f"File not found. Checked: {source_video_path} AND {source}")
+
+        if source.exists():
+            logger.info(f"Copying local video: {source} -> {target_path}")
+            shutil.copy2(source, target_path)
+            return relative_path
+
+        # 4. Fallback: If not found locally, try treating strictly as a MinIO Key
+        # This handles cases where 'minio_key' is passed like "chat_id/video.mp4" (no s3://)
+        logger.info(f"File not found locally at {source}. Attempting to download from MinIO bucket '{MINIO_BUCKET}'...")
+        try:
+            minio_client.fget_object(MINIO_BUCKET, source_video_path, str(target_path))
+            logger.info(f"Downloaded raw key from MinIO: {source_video_path} -> {target_path}")
+            return relative_path
+        except Exception as e:
+            # If both local check and MinIO download fail, raise error
+            logger.error(f"Failed to resolve video path locally or via MinIO: {e}")
             raise ValueError(f"Source video not found at: {source_video_path}")
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        filename = f"video_{timestamp}_{unique_id}.mp4"  # Assuming MP4; adjust if needed
-        
-        target_path = Path(VIDEO_OUTPUT_DIR) / filename
-        logger.info(f"Copying video: {source} -> {target_path}")
-        shutil.copy2(source, target_path)
-        
-        relative_path = f"/static/videos/{filename}"
-        logger.info(f"Video saved/copied to: {relative_path}")
-        
-        return relative_path
+
     except Exception as e:
         logger.error(f"Failed to save video to static dir: {str(e)}")
         raise
@@ -573,14 +609,11 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                     if "markdown_output" in data:
                         final_content = data["markdown_output"]
 
-                    elif "minio_key" in data: # Check for the new key name from DAG
+                    elif "minio_key" in data: 
                         video_object_key = data["minio_key"]
+                        # This function now handles the download automatically!
+                        video_url = save_video_to_static_dir(video_object_key) 
                         
-                        # Generate Presigned URL (Valid for 1 hour)
-                        video_url = get_presigned_url(video_object_key)
-                        logger.info(f"Generated presigned URL: {video_url}")
-                        
-                        # Use the URL directly. Do NOT try to copy file locally.
                         final_content = (
                             f"### 🎬 Video Ready!\n\n"
                             f"Your video has been generated successfully.\n\n"
@@ -590,25 +623,26 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                             f'</video>\n\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
+                        is_rich_media = True
                     
                     elif "video_path" in data:
-                        video_object_key = data["video_path"]
-                        video_url = get_presigned_url(video_object_key)
-                        logger.info(f"Generated presigned URL for video: {video_url}")
                         vid_path = data["video_path"]
-                        video_url = save_video_to_static_dir(vid_path)
-                        
-                        final_content = (
-                            f"### 🎬 Video Ready!\n\n"
-                            f"Your video has been generated successfully.\n\n"
-                            f'<video width="100%" controls>\n'
-                            f'  <source src="{video_url}" type="video/mp4">\n'
-                            f'  Your browser does not support the video tag.\n'
-                            f'</video>\n\n'
-                            f"[**⬇️ Click here to Download**]({video_url})"
-                        )
-                    
-                        is_rich_media = True
+                        # Only try to save to static if it looks like a local path
+                        if not vid_path.startswith("s3://"):
+                            video_url = save_video_to_static_dir(vid_path)
+                        else:
+                            # It was an S3 path labeled as video_path
+                            video_url = get_presigned_url(vid_path)
+                            final_content = (
+                                    f"### 🎬 Video Ready!\n\n"
+                                    f"Your video has been generated successfully.\n\n"
+                                    f'<video width="100%" controls>\n'
+                                    f'  <source src="{video_url}" type="video/mp4">\n'
+                                    f'  Your browser does not support the video tag.\n'
+                                    f'</video>\n\n'
+                                    f"[**⬇️ Click here to Download**]({video_url})"
+                                )
+                            is_rich_media = True
                     elif "file_size" in data:
                         final_content = f"**Image Saved**\nFile: `{os.path.basename(data.get('image_path', ''))}`\nSize: {data.get('file_size')} bytes"
                         
