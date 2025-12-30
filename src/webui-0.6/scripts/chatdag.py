@@ -264,6 +264,12 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
     request_id = headers.get("x-openwebui-request-id", str(uuid.uuid4()))
     is_internal = "ecloudcontrol.com" in user_email or user_role == "admin"
     task_docs = await get_task_docs(dag_id)
+    
+    # Initialize variables at the start to avoid UnboundLocalError
+    is_rich_media = False
+    final_content = "Processing..."
+    video_url = None
+    
     # --- Start the visible <think> block ---
     think_open = "<think>\n"
     yield StreamChunk(
@@ -459,7 +465,6 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                 logger.info(f"Final poll identified last successful task: {last_success_task}")
 
         # Final XCom Retrieval
-        is_rich_media = False
         final_content = "DAG completed but no result found."
         if last_success_task:
             xcom_url = f"{AIRFLOW_HOST}/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{last_success_task}/xcomEntries/return_value"
@@ -517,7 +522,7 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
     ).model_dump_json() + "\n"
 
     # Stream the Final Response
-    if is_rich_media:
+    if is_rich_media and video_url:
         # IMPORTANT: Send rich HTML in one atomic message
         yield StreamChunk(
             model=model,
