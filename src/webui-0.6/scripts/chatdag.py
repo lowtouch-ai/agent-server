@@ -52,6 +52,36 @@ LOGS_ROOT = os.getenv("LOGS_DIR")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
+from minio import Minio
+from minio.error import S3Error
+from datetime import timedelta
+
+# --- REMOVE/MODIFY CONFIGURATION ---
+# (Keep your Airflow configs, but add MinIO configs below)
+
+# MinIO Configuration
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "minio:9000") # e.g., localhost:9000
+MINIO_ACCESS_KEY = os.getenv("CF_MINIO_USER", "minioadmin")
+MINIO_SECRET_KEY = os.getenv("CF_MINIO_PASSWORD", "minioadmin")
+MINIO_BUCKET = os.getenv("CF_MINIO_BUCKET", "clipfoundry")
+# Set secure=True if using HTTPS
+MINIO_SECURE = os.getenv("MINIO_SECURE", "False").lower() == "true"
+
+# Initialize MinIO Client
+try:
+    minio_client = Minio(
+        MINIO_ENDPOINT,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=MINIO_SECURE
+    )
+    # Ensure bucket exists
+    if not minio_client.bucket_exists(MINIO_BUCKET):
+        minio_client.make_bucket(MINIO_BUCKET)
+        logger.info(f"Created MinIO bucket: {MINIO_BUCKET}")
+except Exception as e:
+    logger.error(f"MinIO Connection Error: {e}")
+
 # Ensure storage directory exists
 Path(SHARED_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 Path(VIDEO_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
@@ -97,31 +127,127 @@ class FinalResponse(BaseModel):
     eval_count: int
     eval_duration: int
 
-def save_video_to_static_dir(source_video_path: str) -> str:
-    """Save or copy the video to the static videos directory and return the relative path."""
+def save_image_to_minio(image_bytes: bytes, chat_id: str, metadata: dict) -> dict:
+    """Uploads image to MinIO under the chat_id prefix."""
     try:
+        format_to_ext = {
+            "JPEG": ".jpg", "PNG": ".png", "GIF": ".gif",
+            "BMP": ".bmp", "WEBP": ".webp"
+        }
+        file_ext = format_to_ext.get(metadata.get("format", "PNG"), ".png")
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"img_{timestamp}_{unique_id}{file_ext}"
+        
+        # KEY CHANGE: Organize by chat_id
+        object_name = f"{chat_id}/{filename}"
+        
+        # Create stream for MinIO
+        data_stream = io.BytesIO(image_bytes)
+        size = len(image_bytes)
+        
+        minio_client.put_object(
+            bucket_name=MINIO_BUCKET,
+            object_name=object_name,
+            data=data_stream,
+            length=size,
+            content_type=f"image/{file_ext.strip('.')}"
+        )
+        
+        logger.info(f"Image uploaded to MinIO: {MINIO_BUCKET}/{object_name}")
+        
+        return {
+            "filename": filename,
+            "bucket": MINIO_BUCKET,
+            "object_name": object_name,
+            "s3_uri": f"s3://{MINIO_BUCKET}/{object_name}",
+            "size_bytes": size,
+            "saved_at": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Failed to save image to MinIO: {str(e)}")
+        raise
+
+def get_presigned_url(object_name: str, expiration=timedelta(hours=1)) -> str:
+    """Generates a temporary URL for viewing content (Images/Videos)."""
+    try:
+        # Strip s3:// prefix if present
+        if object_name.startswith(f"s3://{MINIO_BUCKET}/"):
+            object_name = object_name.replace(f"s3://{MINIO_BUCKET}/", "")
+            
+        url = minio_client.get_presigned_url(
+            "GET",
+            MINIO_BUCKET,
+            object_name,
+            expires=expiration
+        )
+        return url
+    except Exception as e:
+        logger.error(f"Failed to generate presigned URL: {str(e)}")
+        return ""
+
+def save_video_to_static_dir(source_video_path: str) -> str:
+    """
+    Save the video to the static videos directory.
+    - If input is a local path, it copies the file.
+    - If input is a MinIO/S3 path, it downloads the file.
+    Returns the relative path for the UI.
+    """
+    try:
+        # 1. Generate Target Filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        
+        # Deduce extension or default to .mp4
+        ext = os.path.splitext(source_video_path)[1]
+        if not ext or len(ext) > 5: # Safety check on extension length
+            ext = ".mp4"
+            
+        filename = f"video_{timestamp}_{unique_id}{ext}"
+        target_path = Path(VIDEO_OUTPUT_DIR) / filename
+        relative_path = f"/static/videos/{filename}"
+
+        # 2. Check if it is an S3 URI (Explicit MinIO)
+        if source_video_path.startswith("s3://"):
+            logger.info(f"Detected S3 URI: {source_video_path}")
+            
+            # Remove s3:// prefix
+            clean_path = source_video_path.replace("s3://", "")
+            
+            # Parse Bucket and Object Name
+            if "/" in clean_path:
+                bucket, object_name = clean_path.split("/", 1)
+            else:
+                # Edge case: if path is just the bucket? unlikely for a video file
+                raise ValueError(f"Invalid S3 path format: {source_video_path}")
+            
+            logger.info(f"Downloading from MinIO [Bucket: {bucket}, Key: {object_name}] -> {target_path}")
+            minio_client.fget_object(bucket, object_name, str(target_path))
+            return relative_path
         source = Path(source_video_path)
         
         if not source.exists():
             clean_rel = str(source).lstrip("/") 
             source = Path(SHARED_STORAGE_PATH) / clean_rel
-            
-        if not source.exists():
-            logger.error(f"File not found. Checked: {source_video_path} AND {source}")
+
+        if source.exists():
+            logger.info(f"Copying local video: {source} -> {target_path}")
+            shutil.copy2(source, target_path)
+            return relative_path
+
+        # 4. Fallback: If not found locally, try treating strictly as a MinIO Key
+        # This handles cases where 'minio_key' is passed like "chat_id/video.mp4" (no s3://)
+        logger.info(f"File not found locally at {source}. Attempting to download from MinIO bucket '{MINIO_BUCKET}'...")
+        try:
+            minio_client.fget_object(MINIO_BUCKET, source_video_path, str(target_path))
+            logger.info(f"Downloaded raw key from MinIO: {source_video_path} -> {target_path}")
+            return relative_path
+        except Exception as e:
+            # If both local check and MinIO download fail, raise error
+            logger.error(f"Failed to resolve video path locally or via MinIO: {e}")
             raise ValueError(f"Source video not found at: {source_video_path}")
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        unique_id = str(uuid.uuid4())[:8]
-        filename = f"video_{timestamp}_{unique_id}.mp4"  # Assuming MP4; adjust if needed
-        
-        target_path = Path(VIDEO_OUTPUT_DIR) / filename
-        logger.info(f"Copying video: {source} -> {target_path}")
-        shutil.copy2(source, target_path)
-        
-        relative_path = f"/static/videos/{filename}"
-        logger.info(f"Video saved/copied to: {relative_path}")
-        
-        return relative_path
+
     except Exception as e:
         logger.error(f"Failed to save video to static dir: {str(e)}")
         raise
@@ -487,18 +613,41 @@ async def generate_stream_response(model: str, image_paths: List[str], original_
                     
                     if "markdown_output" in data:
                         final_content = data["markdown_output"]
-                    
-                    elif "video_path" in data:
-                        vid_path = data["video_path"]
-                        video_url = save_video_to_static_dir(vid_path)
+
+                    elif "minio_key" in data: 
+                        video_object_key = data["minio_key"]
+                        # This function now handles the download automatically!
+                        video_url = save_video_to_static_dir(video_object_key) 
                         
                         final_content = (
                             f"### 🎬 Video Ready!\n\n"
                             f"Your video has been generated successfully.\n\n"
+                            f'<video width="100%" controls>\n'
+                            f'  <source src="{video_url}" type="video/mp4">\n'
+                            f'  Your browser does not support the video tag.\n'
+                            f'</video>\n\n'
                             f"[**⬇️ Click here to Download**]({video_url})"
                         )
-                    
                         is_rich_media = True
+                    
+                    elif "video_path" in data:
+                        vid_path = data["video_path"]
+                        # Only try to save to static if it looks like a local path
+                        if not vid_path.startswith("s3://"):
+                            video_url = save_video_to_static_dir(vid_path)
+                        else:
+                            # It was an S3 path labeled as video_path
+                            video_url = get_presigned_url(vid_path)
+                            final_content = (
+                                    f"### 🎬 Video Ready!\n\n"
+                                    f"Your video has been generated successfully.\n\n"
+                                    f'<video width="100%" controls>\n'
+                                    f'  <source src="{video_url}" type="video/mp4">\n'
+                                    f'  Your browser does not support the video tag.\n'
+                                    f'</video>\n\n'
+                                    f"[**⬇️ Click here to Download**]({video_url})"
+                                )
+                            is_rich_media = True
                     elif "file_size" in data:
                         final_content = f"**Image Saved**\nFile: `{os.path.basename(data.get('image_path', ''))}`\nSize: {data.get('file_size')} bytes"
                         
@@ -692,18 +841,16 @@ async def chat_dag(request: Request):
             for idx, base64_image in enumerate(images, 1):
                 try:
                     image_bytes, metadata = verify_and_decode_image(base64_image)
-                    save_info = save_image(image_bytes, chat_shared_path, metadata)
+                    save_info = save_image_to_minio(image_bytes, chat_id, metadata)
                     saved_images.append(save_info)
                     # Capture the absolute path for the DAG
-                    saved_paths.append(save_info['path'])
+                    saved_paths.append(save_info['s3_uri'])
                     
                     response_parts.append(
-                        f"\n📸 **Image {idx} Saved Successfully:**\n"
-                        f"   • Format: {metadata['format']}\n"
-                        f"   • Dimensions: {metadata['width']}x{metadata['height']} pixels\n"
-                        f"   • Size: {metadata['size_bytes'] / 1024:.2f} KB\n"
-                        f"   • Filename: `{save_info['filename']}`\n"
-                        f"   • Path: `{save_info['relative_path']}`\n"
+                        f"\n📸 **Image {idx} Saved (MinIO):**\n"
+                        f"   • Dimensions: {metadata['width']}x{metadata['height']}\n"
+                        f"   • Bucket: `{save_info['bucket']}`\n"
+                        f"   • Path: `{save_info['object_name']}`\n"
                     )
                 except Exception as e:
                     logger.error(f"Error processing image {idx}: {str(e)}")
