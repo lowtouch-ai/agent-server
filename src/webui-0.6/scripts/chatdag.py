@@ -663,39 +663,44 @@ async def chat_dag(request: Request):
         last_message = messages[-1]
         user_content = last_message.get("content", "").strip()
         images = last_message.get("images", [])
-
-        if not images:
-            logger.info("No images in current message, checking conversation history...")
-            # Iterate backwards through previous messages
-            for msg in reversed(messages[:-1]):
-                if msg.get("images") and isinstance(msg["images"], list) and len(msg["images"]) > 0:
-                    images = msg["images"]
-                    logger.info(f"✅ Found {len(images)} images in previous conversation context.")
-                    break
         
-        # Collect existing images from chat directory
+        # Collect EXISTING images from chat directory FIRST
         existing_paths = []
         for file_path in chat_shared_path.iterdir():
             if file_path.suffix.lower() in ALLOWED_EXTENSIONS:
                 existing_paths.append(str(file_path))
-        logger.info(f"Found {len(existing_paths)} existing images in chat directory: {[p.name for p in chat_shared_path.iterdir() if p.suffix.lower() in ALLOWED_EXTENSIONS]}")
         
-        logger.info(f"Processing message with {len(images)} image(s), stream={stream}")
+        logger.info(f"Found {len(existing_paths)} existing images in chat directory")
+        
+        # Check if current message has NEW images
+        has_new_images = images and isinstance(images, list) and len(images) > 0
+        
+        if not has_new_images:
+            logger.info("No new images in current message, checking conversation history...")
+            # Don't pull from history - we already have existing_paths
+            # Only log what we found
+            logger.info(f"Will use {len(existing_paths)} existing images from chat directory")
+        
+        logger.info(f"Processing message with {len(images)} NEW image(s), {len(existing_paths)} existing, stream={stream}")
         
         response_parts = []
         saved_images = []
-        saved_paths = []
+        newly_saved_paths = []
         
-        if images:
-            response_parts.append(f"👤 Hello {user_name}! I received {len(images)} new image(s). There are already {len(existing_paths)} images in this chat.\n")
+        # Only process and save NEW images from current message
+        if has_new_images:
+            response_parts.append(
+                f"👤 Hello {user_name}! I received {len(images)} new image(s). "
+                f"There are already {len(existing_paths)} images in this chat.\n"
+            )
             
             for idx, base64_image in enumerate(images, 1):
                 try:
                     image_bytes, metadata = verify_and_decode_image(base64_image)
                     save_info = save_image(image_bytes, chat_shared_path, metadata)
                     saved_images.append(save_info)
-                    # Capture the absolute path for the DAG
-                    saved_paths.append(save_info['path'])
+                    # Store the absolute path for newly saved images
+                    newly_saved_paths.append(save_info['path'])
                     
                     response_parts.append(
                         f"\n📸 **Image {idx} Saved Successfully:**\n"
@@ -717,24 +722,39 @@ async def chat_dag(request: Request):
                 f"   • Storage: `{SHARED_STORAGE_PATH}/{chat_id}/`\n"
             )
         else:
-            response_parts.append(
-                f"👋 Hello {user_name}!\n\n"
-                f"I'm the **Image Saver Assistant**. Send me images and I'll save them to shared storage.\n\n"
-                f"📝 Your message: {user_content or 'No text, waiting for images...'}\n\n"
-                f"💡 **How to use:** Attach images and send!\n\n"
-                f"📂 **Existing images in chat:** {len(existing_paths)} available."
-            )
+            # No new images uploaded
+            if existing_paths:
+                response_parts.append(
+                    f"👋 Hello {user_name}!\n\n"
+                    f"📝 Your message: {user_content or 'Processing request...'}\n\n"
+                    f"📂 Using {len(existing_paths)} existing image(s) from this chat.\n"
+                )
+            else:
+                response_parts.append(
+                    f"👋 Hello {user_name}!\n\n"
+                    f"I'm the **Image Saver Assistant**. Send me images and I'll save them to shared storage.\n\n"
+                    f"📝 Your message: {user_content or 'No text, waiting for images...'}\n\n"
+                    f"💡 **How to use:** Attach images and send!\n\n"
+                    f"📂 **Existing images in chat:** {len(existing_paths)} available."
+                )
         
-        # Append existing paths to saved_paths (now all_image_paths)
-        all_image_paths = existing_paths + saved_paths
+        # Combine existing + newly saved paths for DAG processing
+        all_image_paths = existing_paths + newly_saved_paths
+        
         response_parts.append(f"\n🔗 **Total images available for processing:** {len(all_image_paths)}")
+        
+        logger.info(f"Passing {len(all_image_paths)} images to DAG: {len(existing_paths)} existing + {len(newly_saved_paths)} new")
         
         response_content = "".join(response_parts)
         
         if stream:
-            # Always trigger with all_image_paths (including existing + new)
+            # Pass all available images to the streaming response
             return StreamingResponse(
-                generate_stream_response(model, all_image_paths, user_content, dag_id, headers, messages, user_email, user_id, user_name, user_role, vault_user, vault_keys, chat_id),
+                generate_stream_response(
+                    model, all_image_paths, user_content, dag_id, headers, 
+                    messages, user_email, user_id, user_name, user_role, 
+                    vault_user, vault_keys, chat_id
+                ),
                 media_type="application/x-ndjson"
             )
         else:
